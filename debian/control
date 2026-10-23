@@ -1,0 +1,28 @@
+Source: pingtop
+Section: net
+Priority: optional
+Maintainer: vals0v <https://github.com/vals0v/Pingtop>
+Build-Depends:
+ debhelper-compat (= 13),
+ cmake (>= 3.20),
+ g++ (>= 11)
+Standards-Version: 4.6.2
+Homepage: https://github.com/vals0v/Pingtop
+Rules-Requires-Root: no
+
+Package: pingtop
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends}
+Description: interactive TUI network latency, MTR, traffic and quality monitor
+ Pingtop is an interactive terminal-based network monitoring tool written
+ in modern C++20 with zero external dependencies.
+ .
+ Key features:
+  * High-frequency ICMP, ICMPv6, TCP SYN/ACK, and UDP/53 DNS latency probing.
+  * Hop-by-hop live MTR / Traceroute engine with offline GeoIP/ASN info.
+  * Real-time network interface bandwidth monitor with solid UTF-8 block charts.
+  * Automatic local gateway, LAN, ARP, and Tailscale/VPN discovery.
+  * Latency percentiles (p50, p90, p95, p99), jitter calculation, and MTU check.
+  * btop-inspired adaptive responsive terminal UI with zero external runtime deps.
