@@ -48,3 +48,20 @@ if(PINGTOP_STATIC_LIBCXX AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 install(TARGETS pingtop RUNTIME DESTINATION bin)
+
+# --- Настройки сборки Debian (.deb) пакета ---
+set(CPACK_GENERATOR "DEB")
+set(CPACK_PACKAGE_NAME "pingtop")
+set(CPACK_PACKAGE_VENDOR "vals0v")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Interactive C++20 network latency, MTR, traffic and quality monitor")
+set(CPACK_PACKAGE_VERSION "1.3.0")
+set(CPACK_PACKAGE_CONTACT "vals0v <https://github.com/vals0v/Pingtop>")
+set(CPACK_DEBIAN_PACKAGE_SECTION "net")
+set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+
+# Разрешаем запуск без sudo сразу после установки
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA "${CMAKE_CURRENT_SOURCE_DIR}/packaging/debian/postinst")
+
+include(CPack)
