@@ -125,10 +125,13 @@ constexpr std::array<const char*, 8> kSparkBlocks = {
 }
 
 [[nodiscard]] std::string format_probe_badge(const HostEntry& h) {
+    if (h.probe_type == ProbeType::Dns) {
+        return "DNS:53";
+    }
     if (h.probe_type == ProbeType::Tcp) {
         return "TCP:" + std::to_string(h.tcp_port);
     }
-    return "ICMP";
+    return h.is_ipv6 ? "ICMPv6" : "ICMP";
 }
 
 } // namespace
@@ -233,8 +236,11 @@ bool TuiRenderer::matches_filter(const HostEntry& host) const noexcept {
     return icontains(host.display_name, filter_query_) ||
            icontains(host.hostname, filter_query_) ||
            icontains(host.resolved_ip, filter_query_) ||
+           icontains(host.asn_info, filter_query_) ||
+           (host.probe_type == ProbeType::Dns && icontains("dns", filter_query_)) ||
            (host.probe_type == ProbeType::Tcp && icontains("tcp", filter_query_)) ||
-           (host.probe_type == ProbeType::Icmp && icontains("icmp", filter_query_));
+           (host.probe_type == ProbeType::Icmp && icontains("icmp", filter_query_)) ||
+           (host.is_ipv6 && icontains("ipv6", filter_query_));
 }
 
 std::vector<std::size_t> TuiRenderer::build_visible_order(const NetworkMonitor& monitor) const {
@@ -504,7 +510,16 @@ void TuiRenderer::append_host_row(const HostEntry& h, bool is_selected, std::siz
     frame_buffer_.append(is_selected ? "\033[96m▸" : " ");
     frame_buffer_.append(kFgWhite).append(fit_string(h.display_name, 18)).append(" ");
     frame_buffer_.append(kFgGray).append(fit_string(h.resolved_ip, 15)).append(" ");
-    frame_buffer_.append(h.probe_type == ProbeType::Tcp ? kFgMagenta : kFgCyan)
+
+    const char* proto_color = kFgCyan;
+    if (h.probe_type == ProbeType::Tcp) {
+        proto_color = kFgMagenta;
+    } else if (h.probe_type == ProbeType::Dns) {
+        proto_color = kFgYellow;
+    } else if (h.is_ipv6) {
+        proto_color = kFgYellowGreen;
+    }
+    frame_buffer_.append(proto_color)
                  .append(fit_string(format_probe_badge(h), 7))
                  .append(" ");
 
@@ -643,6 +658,18 @@ void TuiRenderer::append_detail_view(const NetworkMonitor& monitor, const std::v
                  .append(kFgGray).append("  — Press Enter or b to return to Table")
                  .append(kClearLineEnd).append(kReset).append("\n");
 
+    char diag_buf[256]{};
+    std::snprintf(
+        diag_buf,
+        sizeof(diag_buf),
+        " GeoIP / ASN: %s  │  Path MTU: %u B (press 'm' to probe DF MTU)  │  Stack: %s  │  Last TTL: %u",
+        h.asn_info.empty() ? "---" : h.asn_info.c_str(),
+        static_cast<unsigned int>(h.path_mtu),
+        h.is_ipv6 ? "IPv6" : "IPv4",
+        static_cast<unsigned int>(h.last_ttl)
+    );
+    frame_buffer_.append(kBold).append(kFgCyan).append(diag_buf).append(kReset).append(kClearLineEnd).append("\n");
+
     char p_buf[256]{};
     std::snprintf(
         p_buf,
@@ -763,18 +790,18 @@ void TuiRenderer::append_mtr_view(const NetworkMonitor& monitor) {
                  .append(kFgGray).append("  — Press t or b to return")
                  .append(kClearLineEnd).append(kReset).append("\n");
 
-    constexpr int kFixedColsWidth = 91;
+    constexpr int kFixedColsWidth = 88;
     const std::size_t spark_width = static_cast<std::size_t>(
         std::clamp(term_width_ - kFixedColsWidth, 10, static_cast<int>(HostEntry::kHistoryCapacity))
     );
 
     frame_buffer_.append(kBgSection).append(kBold).append(kFgCyan);
     frame_buffer_.append(" ")
-                 .append(fit_string("HOP", 18))
+                 .append(fit_string("HOP", 14))
                  .append(" ")
                  .append(fit_string("HOP IP", 15))
                  .append(" ")
-                 .append(fit_string("PROTO", 7))
+                 .append(fit_string("GEO / ASN / ISP", 20))
                  .append(" ")
                  .append(fit_string("STATUS", 8))
                  .append(" ")
@@ -782,11 +809,7 @@ void TuiRenderer::append_mtr_view(const NetworkMonitor& monitor) {
                  .append(" ")
                  .append(fit_string("LAST", 6, true))
                  .append(" ")
-                 .append(fit_string("MIN", 6, true))
-                 .append(" ")
                  .append(fit_string("AVG", 6, true))
-                 .append(" ")
-                 .append(fit_string("MAX", 6, true))
                  .append(" ")
                  .append(fit_string("JITTER", 6, true))
                  .append("  ")
@@ -802,7 +825,37 @@ void TuiRenderer::append_mtr_view(const NetworkMonitor& monitor) {
                      .append(kReset).append(kClearLineEnd).append("\n");
     } else {
         for (const auto& hop : hops) {
-            append_host_row(hop.entry, false, spark_width);
+            const HostEntry& h = hop.entry;
+            frame_buffer_.append(" ")
+                         .append(kFgWhite).append(fit_string(h.display_name, 14)).append(" ")
+                         .append(kFgGray).append(fit_string(h.resolved_ip, 15)).append(" ")
+                         .append(kFgYellow).append(fit_string(h.asn_info.empty() ? "---" : h.asn_info, 20)).append(" ");
+
+            switch (h.status) {
+                case HostStatus::Online:   frame_buffer_.append(kFgGreen).append(fit_string("● ONLINE", 8)); break;
+                case HostStatus::Offline:  frame_buffer_.append(kFgRed).append(fit_string("✖ DOWN  ", 8)); break;
+                case HostStatus::Pending:  frame_buffer_.append(kFgYellow).append(fit_string("◌ WAIT  ", 8)); break;
+                case HostStatus::DnsError: frame_buffer_.append(kFgRed).append(fit_string("! DNSERR", 8)); break;
+            }
+            frame_buffer_.append(" ");
+
+            const double loss = h.packet_loss_percent();
+            char loss_buf[16]{};
+            std::snprintf(loss_buf, sizeof(loss_buf), "%.1f%%", loss);
+            frame_buffer_.append(loss_color(loss)).append(fit_string(loss_buf, 6, true)).append(" ");
+
+            const bool has_samples = (h.received_count > 0);
+            const bool last_valid = (h.status == HostStatus::Online && has_samples);
+
+            frame_buffer_.append(last_valid ? latency_color(h.last_rtt_ms) : kFgRed)
+                         .append(format_metric(h.last_rtt_ms, last_valid, 6)).append(" ");
+            frame_buffer_.append(has_samples ? latency_color(h.avg_rtt_ms) : kFgGray)
+                         .append(format_metric(h.avg_rtt_ms, has_samples, 6)).append(" ");
+            frame_buffer_.append(has_samples ? jitter_color(h.jitter_ms) : kFgGray)
+                         .append(format_metric(h.jitter_ms, has_samples, 6)).append("  ");
+
+            frame_buffer_.append(build_sparkline(h.history, spark_width));
+            frame_buffer_.append(kClearLineEnd).append(kReset).append("\n");
         }
     }
 }
@@ -827,16 +880,15 @@ void TuiRenderer::append_footer(const NetworkMonitor& monitor, const std::vector
         const HostEntry& sel = monitor.hosts()[order[std::min(selected_row_, order.size() - 1)]];
         const LatencyPercentiles pct = sel.compute_percentiles();
 
-        char detail_buf[256]{};
+        char detail_buf[320]{};
         std::snprintf(
             detail_buf,
             sizeof(detail_buf),
-            " Selected: %s (%s) │ Sent/Recv/Lost: %llu/%llu/%llu │ p50: %.1fms  p95: %.1fms  p99: %.1fms │ TTL: %u",
+            " Selected: %s (%s) │ ASN: %s │ MTU: %uB │ p50: %.1fms  p95: %.1fms  p99: %.1fms │ TTL: %u",
             sel.display_name.c_str(),
             sel.resolved_ip.c_str(),
-            static_cast<unsigned long long>(sel.sent_count),
-            static_cast<unsigned long long>(sel.received_count),
-            static_cast<unsigned long long>(sel.lost_count),
+            sel.asn_info.empty() ? "---" : sel.asn_info.c_str(),
+            static_cast<unsigned int>(sel.path_mtu),
             pct.p50,
             pct.p95,
             pct.p99,
@@ -860,6 +912,7 @@ void TuiRenderer::append_footer(const NetworkMonitor& monitor, const std::vector
                  .append(kFgCyan).append(" q ").append(kFgWhite).append("Quit ")
                  .append(kFgCyan).append(" Enter ").append(kFgWhite).append("2D Graph/p99 ")
                  .append(kFgCyan).append(" t ").append(kFgWhite).append("MTR Trace ")
+                 .append(kFgCyan).append(" m ").append(kFgWhite).append("MTU Test ")
                  .append(kFgCyan).append(" / ").append(kFgWhite).append("Search ")
                  .append(kFgCyan).append(" g ").append(kFgWhite).append("Group ")
                  .append(kFgCyan).append(" d ").append(kFgWhite).append("Scan LAN/VPN ")

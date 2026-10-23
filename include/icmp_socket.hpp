@@ -54,9 +54,11 @@ struct IcmpReply {
 
 class IcmpSocket {
 public:
-    static constexpr std::uint8_t  kIcmpEchoRequest = 8;
-    static constexpr std::uint8_t  kIcmpEchoReply   = 0;
-    static constexpr std::uint64_t kPayloadMagic    = 0x50494E47544F5031ULL; // "PINGTOP1"
+    static constexpr std::uint8_t  kIcmpEchoRequest   = 8;
+    static constexpr std::uint8_t  kIcmpEchoReply     = 0;
+    static constexpr std::uint8_t  kIcmpv6EchoRequest = 128;
+    static constexpr std::uint8_t  kIcmpv6EchoReply   = 129;
+    static constexpr std::uint64_t kPayloadMagic      = 0x50494E47544F5031ULL; // "PINGTOP1"
 
     IcmpSocket() noexcept;
     ~IcmpSocket() noexcept;
@@ -70,7 +72,9 @@ public:
     void close() noexcept;
 
     [[nodiscard]] bool is_open() const noexcept { return fd_ >= 0; }
+    [[nodiscard]] bool is_v6_open() const noexcept { return fd6_ >= 0; }
     [[nodiscard]] int fd() const noexcept { return fd_; }
+    [[nodiscard]] int fd6() const noexcept { return fd6_; }
     [[nodiscard]] SocketMode mode() const noexcept { return mode_; }
     [[nodiscard]] std::string_view mode_string() const noexcept;
     [[nodiscard]] const std::string& last_error() const noexcept { return last_error_; }
@@ -82,14 +86,29 @@ public:
         std::chrono::steady_clock::time_point send_time
     ) noexcept;
 
+    [[nodiscard]] bool send_echo_request_v6(
+        const sockaddr_in6& dest_addr,
+        std::uint16_t host_index,
+        std::uint32_t sequence,
+        std::chrono::steady_clock::time_point send_time
+    ) noexcept;
+
     [[nodiscard]] std::optional<IcmpReply> receive_echo_reply(
         std::chrono::steady_clock::time_point receive_time
     ) noexcept;
+
+    [[nodiscard]] std::optional<IcmpReply> receive_echo_reply_v6(
+        std::chrono::steady_clock::time_point receive_time
+    ) noexcept;
+
+    // Active Path MTU probe with Don't Fragment (DF) bit set
+    [[nodiscard]] static std::uint16_t probe_path_mtu(const sockaddr_in& dest_addr) noexcept;
 
     [[nodiscard]] static std::uint16_t compute_checksum(const void* data, std::size_t length) noexcept;
 
 private:
     int           fd_{-1};
+    int           fd6_{-1};
     SocketMode    mode_{SocketMode::None};
     std::uint16_t client_id_{0};
     std::string   last_error_;

@@ -14,9 +14,9 @@ namespace {
 
 void print_help(std::string_view prog_name) {
     std::cout
-        << "Pingtop v1.2.0 — Interactive TUI Network Latency, MTR & Quality Monitor (C++20)\n\n"
+        << "Pingtop v1.3.0 — Interactive TUI Network Latency, MTR & Quality Monitor (C++20)\n\n"
         << "Usage:\n"
-        << "  " << prog_name << " [OPTIONS] [HOST... | HOST:PORT... | LABEL=HOST[:PORT]...]\n\n"
+        << "  " << prog_name << " [OPTIONS] [HOST... | HOST:PORT... | dns://HOST... | LABEL=TARGET...]\n\n"
         << "Options:\n"
         << "  -i, --interval <ms>   Ping interval in milliseconds (100..10000, default: 1000)\n"
         << "  -c, --count <num>     Exit automatically after <num> ping rounds (default: 0 = infinite)\n"
@@ -24,12 +24,13 @@ void print_help(std::string_view prog_name) {
         << "  -h, --help            Show this help message and exit\n\n"
         << "Examples:\n"
         << "  " << prog_name << "                                      # Auto-discover LAN, VPN, Tailscale & config\n"
-        << "  " << prog_name << " 1.1.1.1 github.com:443               # ICMP + TCP SYN Ping on port 443\n"
-        << "  " << prog_name << " -i 500 Router=192.168.1.1 Web=google.com:443\n\n"
+        << "  " << prog_name << " 1.1.1.1 github.com:443 dns://8.8.8.8 # ICMP + TCP SYN + UDP:53 DNS Benchmark\n"
+        << "  " << prog_name << " 2606:4700:4700::1111                 # IPv6 ICMPv6 Ping\n\n"
         << "Interactive TUI Hotkeys:\n"
-        << "  Enter / v   Open 2D Latency Graph, Percentiles (p50/p90/p95/p99) & Histogram\n"
-        << "  t           Open live Hop-by-Hop MTR / Traceroute view for selected host\n"
-        << "  /           Live search & filter hosts (by name, IP, or protocol)\n"
+        << "  Enter / v   Open 2D Latency Graph, Percentiles (p50/p90/p95/p99), ASN & Histogram\n"
+        << "  t           Open live Hop-by-Hop MTR / Traceroute view with GeoIP/ASN per hop\n"
+        << "  m           Run active Path MTU Discovery (Don't Fragment binary search) on selected host\n"
+        << "  /           Live search & filter hosts (by name, IP, ASN, or protocol)\n"
         << "  g           Toggle category grouping ([LAN], [VPN & Tailscale], [WAN])\n"
         << "  d           Scan & discover LAN devices (ARP) and VPN/Tailscale peers\n"
         << "  s           Cycle table sorting (Default -> Last RTT -> Avg RTT -> Jitter -> Loss%)\n"
@@ -44,28 +45,32 @@ void print_help(std::string_view prog_name) {
 void print_final_summary(const pingtop::NetworkMonitor& monitor) {
     std::cout << "\n--- Pingtop Session Summary ---\n";
     std::printf(
-        "%-20s %-15s %-7s %6s %6s %7s %8s %8s %8s %8s %8s\n",
-        "TARGET", "IP", "PROTO", "SENT", "RECV", "LOSS%", "MIN(ms)", "AVG(ms)", "MAX(ms)", "P99(ms)", "JITTER"
+        "%-20s %-15s %-7s %-6s %-20s %5s %5s %7s %7s %7s %7s %7s\n",
+        "TARGET", "IP", "PROTO", "MTU", "GEO / ASN", "SENT", "RECV", "LOSS%", "MIN", "AVG", "P99", "JITTER"
     );
-    std::cout << std::string(111, '-') << "\n";
+    std::cout << std::string(124, '-') << "\n";
 
     for (const auto& h : monitor.hosts()) {
         const auto pct = h.compute_percentiles();
-        const std::string proto = (h.probe_type == pingtop::ProbeType::Tcp)
-            ? ("TCP:" + std::to_string(h.tcp_port))
-            : "ICMP";
+        std::string proto = h.is_ipv6 ? "ICMPv6" : "ICMP";
+        if (h.probe_type == pingtop::ProbeType::Dns) {
+            proto = "DNS:53";
+        } else if (h.probe_type == pingtop::ProbeType::Tcp) {
+            proto = "TCP:" + std::to_string(h.tcp_port);
+        }
 
         std::printf(
-            "%-20.20s %-15.15s %-7.7s %6llu %6llu %6.1f%% %8.2f %8.2f %8.2f %8.2f %8.2f\n",
+            "%-20.20s %-15.15s %-7.7s %5uB %-20.20s %5llu %5llu %6.1f%% %7.2f %7.2f %7.2f %7.2f\n",
             h.display_name.c_str(),
             h.resolved_ip.c_str(),
             proto.c_str(),
+            static_cast<unsigned int>(h.path_mtu),
+            h.asn_info.empty() ? "---" : h.asn_info.c_str(),
             static_cast<unsigned long long>(h.sent_count),
             static_cast<unsigned long long>(h.received_count),
             h.packet_loss_percent(),
             h.min_rtt_ms,
             h.avg_rtt_ms,
-            h.max_rtt_ms,
             pct.p99,
             h.jitter_ms
         );
@@ -217,6 +222,10 @@ int main(int argc, char* argv[]) {
                         monitor.start_mtr(renderer.selected_host_index(monitor));
                         renderer.set_view_mode(pingtop::ViewMode::Mtr);
                     }
+                    break;
+                case 'm':
+                case 'M':
+                    monitor.run_mtu_discovery(renderer.selected_host_index(monitor));
                     break;
                 case '/':
                     renderer.start_search();

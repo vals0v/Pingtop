@@ -24,7 +24,8 @@ enum class HostStatus {
 
 enum class ProbeType {
     Icmp,
-    Tcp
+    Tcp,
+    Dns
 };
 
 enum class HostCategory {
@@ -56,10 +57,14 @@ struct HostEntry {
     std::string   hostname;
     std::string   resolved_ip;
     sockaddr_in   addr{};
+    sockaddr_in6  addr6{};
+    bool          is_ipv6{false};
     HostStatus    status{HostStatus::Pending};
     ProbeType     probe_type{ProbeType::Icmp};
     std::uint16_t tcp_port{0};
     HostCategory  category{HostCategory::Internet};
+    std::string   asn_info;
+    std::uint16_t path_mtu{1500};
 
     std::uint64_t sent_count{0};
     std::uint64_t completed_count{0};
@@ -114,6 +119,22 @@ struct DiscoveredTarget {
     HostCategory category{HostCategory::LocalLan};
 };
 
+struct NetInterfaceStats {
+    static constexpr std::size_t kGraphCapacity = 80;
+
+    std::string   name;
+    std::string   ipv4;
+    std::uint64_t rx_total{0};
+    std::uint64_t tx_total{0};
+    double        rx_speed_bps{0.0};
+    double        tx_speed_bps{0.0};
+    double        rx_top_bps{0.0};
+    double        tx_top_bps{0.0};
+
+    RingBuffer<double, kGraphCapacity> rx_history;
+    RingBuffer<double, kGraphCapacity> tx_history;
+};
+
 class NetworkMonitor {
 public:
     static constexpr std::uint16_t kMtrHopFlag = 0x8000U;
@@ -146,6 +167,11 @@ public:
     [[nodiscard]] static std::vector<DiscoveredTarget> discover_vpn_and_tailscale();
     void discover_and_add_network_devices();
 
+    // GeoIP / ASN lookup & Path MTU Discovery
+    [[nodiscard]] static std::string lookup_asn_and_geo(const std::string& ip);
+    [[nodiscard]] static std::uint16_t detect_route_mtu(const std::string& ip, bool is_ipv6) noexcept;
+    void run_mtu_discovery(std::size_t host_idx);
+
     // MTR / Traceroute engine for a specific host
     void start_mtr(std::size_t host_idx);
     void stop_mtr() noexcept;
@@ -165,6 +191,12 @@ public:
     void adjust_interval(std::chrono::milliseconds delta) noexcept;
     void cycle_sort_column() noexcept;
 
+    // Network interface bandwidth telemetry (btop-style net panel)
+    void cycle_net_interface(int delta) noexcept;
+    void reset_net_peaks() noexcept;
+    [[nodiscard]] const std::vector<NetInterfaceStats>& net_interfaces() const noexcept { return net_interfaces_; }
+    [[nodiscard]] std::size_t active_net_index() const noexcept { return active_net_idx_; }
+
     [[nodiscard]] SortColumn sort_column() const noexcept { return sort_column_; }
     [[nodiscard]] std::string_view sort_column_name() const noexcept;
     [[nodiscard]] const std::vector<HostEntry>& hosts() const noexcept { return hosts_; }
@@ -178,8 +210,11 @@ public:
     static constexpr int kKeyArrowDown = -102;
     static constexpr int kKeyBackspace = -103;
     static constexpr int kKeyEscape    = -104;
+    static constexpr int kKeyArrowLeft  = -105;
+    static constexpr int kKeyArrowRight = -106;
 
 private:
+    void sample_net_interfaces(std::chrono::steady_clock::time_point now);
     void dispatch_pings(std::chrono::steady_clock::time_point now);
     void dispatch_host_probe(HostEntry& host, std::uint16_t id_tag, std::chrono::steady_clock::time_point now);
     void check_timeouts(std::chrono::steady_clock::time_point now);
@@ -194,9 +229,12 @@ private:
     std::vector<HostEntry>                hosts_;
     std::chrono::steady_clock::time_point start_time_;
     std::chrono::steady_clock::time_point last_batch_send_time_{};
+    std::chrono::steady_clock::time_point last_net_sample_time_{};
     std::uint64_t                         completed_rounds_{0};
     bool                                  paused_{false};
     SortColumn                            sort_column_{SortColumn::None};
+    std::vector<NetInterfaceStats>        net_interfaces_;
+    std::size_t                           active_net_idx_{0};
 
     // MTR state
     bool                 mtr_active_{false};

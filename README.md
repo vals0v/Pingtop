@@ -8,11 +8,14 @@
 
 ## Features
 
-- **Direct ICMP & Non-blocking TCP Ping Engine**:
-  - Constructs and parses `ICMP Echo Request` / `Echo Reply` (RFC 792) with RFC 1071 checksums directly in userspace.
+- **Direct ICMP, ICMPv6, Non-blocking TCP & DNS Benchmark Engine**:
+  - Constructs and parses `ICMP Echo Request` / `Echo Reply` (RFC 792) and **IPv6 `ICMPv6` (RFC 4443)** directly in userspace.
   - Supports **Non-blocking TCP SYN Ping** (`host:port`, e.g., `1.1.1.1:443`, `github.com:443`) for hosts behind firewalls that block ICMP.
-- **Rootless Operation**: Uses unprivileged ICMP datagram sockets (`SOCK_DGRAM` / `IPPROTO_ICMP`) on macOS and modern Linux, with automatic fallback to `SOCK_RAW`.
-- **Built-in Live MTR / Traceroute (`t` key)**: Hop-by-hop route discovery and real-time latency/loss/sparkline monitoring for every intermediate hop along the network path.
+  - Supports **UDP Port 53 DNS Benchmark** (`dns://1.1.1.1`, `dns://8.8.8.8`, local router DNS) using RFC 1035 DNS queries to measure real DNS resolution latency.
+- **Rootless Operation**: Uses unprivileged ICMP/ICMPv6 datagram sockets (`SOCK_DGRAM` / `IPPROTO_ICMP` / `IPPROTO_ICMPV6`) on macOS and modern Linux, with automatic fallback to `SOCK_RAW`.
+- **GeoIP & ASN Lookup**: Automatically resolves Country, Autonomous System Number (`ASN`), and ISP/Provider (via Team Cymru DNS TXT records & built-in tables) for every host and every intermediate hop in MTR mode.
+- **Path MTU Discovery (`m` key)**: Detects interface/tunnel MTU (`1500B` Ethernet/Wi-Fi, `1280B` Tailscale/WireGuard) and runs active **Don't Fragment (DF)** binary-search Path MTU probing (`576..1500B`).
+- **Built-in Live MTR / Traceroute (`t` key)**: Hop-by-hop route discovery with GeoIP/ASN, real-time latency, loss%, and sparklines for every intermediate hop along the network path.
 - **2D Latency Graph, Percentiles & Histogram (`Enter` key)**:
   - Detailed analytics view with **$p_{50}$ (Median), $p_{90}$, $p_{95}$, $p_{99}$**, standard deviation ($\sigma$), and **RFC 3550 Jitter**;
   - Multi-line 2D UTF-8 latency chart and latency distribution histogram.
@@ -104,9 +107,10 @@ pingtop -i 500 Router=192.168.1.1 Web=google.com:443
 
 | Key | Action |
 | :--- | :--- |
-| `Enter` / `v` | Open **2D Latency Graph, Percentiles ($p_{50}$–$p_{99}$) & Histogram** for selected host |
-| `t` | Open live **Hop-by-Hop MTR / Traceroute** view for selected host |
-| `/` | Live **Search & Filter** hosts by name, IP, or protocol |
+| `Enter` / `v` | Open **2D Latency Graph, Percentiles ($p_{50}$–$p_{99}$), Geo/ASN & Histogram** for selected host |
+| `t` | Open live **Hop-by-Hop MTR / Traceroute** view with GeoIP/ASN per hop |
+| `m` | Run active **Path MTU Discovery (Don't Fragment binary search)** on selected host |
+| `/` | Live **Search & Filter** hosts by name, IP, ASN, or protocol |
 | `g` | Toggle **Category Grouping** (`[LAN]`, `[VPN & Tailscale]`, `[WAN]`) |
 | `d` | Rescan & discover active **LAN (ARP)** and **VPN / Tailscale** devices |
 | `s` | Cycle sort column (`Category/Default` → `Last RTT` → `Avg RTT` → `Jitter` → `Loss%`) |
