@@ -1,16 +1,20 @@
 #pragma once
 
 #include "icmp_socket.hpp"
+#include "net_discovery.hpp"
 #include "ring_buffer.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <mutex>
 #include <netinet/in.h>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace pingtop {
@@ -26,12 +30,6 @@ enum class ProbeType {
     Icmp,
     Tcp,
     Dns
-};
-
-enum class HostCategory {
-    LocalLan,
-    Vpn,
-    Internet
 };
 
 enum class SortColumn {
@@ -96,7 +94,6 @@ struct HostEntry {
     }
 
     [[nodiscard]] LatencyPercentiles compute_percentiles() const;
-
     void reset_stats() noexcept;
 };
 
@@ -113,28 +110,6 @@ struct MonitorConfig {
     std::string               config_file_path;
 };
 
-struct DiscoveredTarget {
-    std::string  ip;
-    std::string  label;
-    HostCategory category{HostCategory::LocalLan};
-};
-
-struct NetInterfaceStats {
-    static constexpr std::size_t kGraphCapacity = 80;
-
-    std::string   name;
-    std::string   ipv4;
-    std::uint64_t rx_total{0};
-    std::uint64_t tx_total{0};
-    double        rx_speed_bps{0.0};
-    double        tx_speed_bps{0.0};
-    double        rx_top_bps{0.0};
-    double        tx_top_bps{0.0};
-
-    RingBuffer<double, kGraphCapacity> rx_history;
-    RingBuffer<double, kGraphCapacity> tx_history;
-};
-
 class NetworkMonitor {
 public:
     static constexpr std::uint16_t kMtrHopFlag = 0x8000U;
@@ -147,7 +122,6 @@ public:
 
     [[nodiscard]] bool initialize();
 
-    // Supports "host", "host:port", and custom categories
     bool add_host(
         const std::string& target,
         const std::string& custom_label = "",
@@ -156,23 +130,18 @@ public:
 
     void add_default_hosts();
 
-    // Config file (~/.config/pingtop/hosts.conf)
     [[nodiscard]] static std::string default_config_path();
     std::size_t load_or_create_config_file(const std::string& path = "");
 
-    // Auto-discovery of local router, LAN devices (ARP), and VPN / Tailscale peers
-    [[nodiscard]] static std::optional<std::string> detect_default_gateway();
-    [[nodiscard]] static std::vector<std::string> get_local_ips();
-    [[nodiscard]] static std::vector<DiscoveredTarget> discover_lan_devices();
-    [[nodiscard]] static std::vector<DiscoveredTarget> discover_vpn_and_tailscale();
+    // Non-blocking background discovery of LAN, ARP & Tailscale/VPN targets
     void discover_and_add_network_devices();
+    void trigger_async_scan();
+    [[nodiscard]] bool is_scanning() const noexcept { return scan_in_progress_.load(std::memory_order_relaxed); }
+    [[nodiscard]] std::string status_message() const;
 
-    // GeoIP / ASN lookup & Path MTU Discovery
-    [[nodiscard]] static std::string lookup_asn_and_geo(const std::string& ip);
-    [[nodiscard]] static std::uint16_t detect_route_mtu(const std::string& ip, bool is_ipv6) noexcept;
     void run_mtu_discovery(std::size_t host_idx);
 
-    // MTR / Traceroute engine for a specific host
+    // MTR / Traceroute engine
     void start_mtr(std::size_t host_idx);
     void stop_mtr() noexcept;
     [[nodiscard]] bool is_mtr_active() const noexcept { return mtr_active_; }
@@ -181,7 +150,6 @@ public:
     [[nodiscard]] const std::string& mtr_target_ip() const noexcept { return mtr_target_ip_; }
     [[nodiscard]] const std::vector<MtrHop>& mtr_hops() const noexcept { return mtr_hops_; }
 
-    // Event loop step (accepts key token: regular ASCII or negative codes for arrows/backspace)
     void poll_once(int poll_timeout_ms, const std::function<void(int)>& on_key_pressed);
     void reset_all_stats() noexcept;
 
@@ -191,7 +159,6 @@ public:
     void adjust_interval(std::chrono::milliseconds delta) noexcept;
     void cycle_sort_column() noexcept;
 
-    // Network interface bandwidth telemetry (btop-style net panel)
     void cycle_net_interface(int delta) noexcept;
     void reset_net_peaks() noexcept;
     [[nodiscard]] const std::vector<NetInterfaceStats>& net_interfaces() const noexcept { return net_interfaces_; }
@@ -205,16 +172,15 @@ public:
     [[nodiscard]] std::uint64_t completed_rounds() const noexcept { return completed_rounds_; }
     [[nodiscard]] std::chrono::steady_clock::time_point start_time() const noexcept { return start_time_; }
 
-    // Special key codes for poll_once callback
-    static constexpr int kKeyArrowUp   = -101;
-    static constexpr int kKeyArrowDown = -102;
-    static constexpr int kKeyBackspace = -103;
-    static constexpr int kKeyEscape    = -104;
+    static constexpr int kKeyArrowUp    = -101;
+    static constexpr int kKeyArrowDown  = -102;
+    static constexpr int kKeyBackspace  = -103;
+    static constexpr int kKeyEscape     = -104;
     static constexpr int kKeyArrowLeft  = -105;
     static constexpr int kKeyArrowRight = -106;
 
 private:
-    void sample_net_interfaces(std::chrono::steady_clock::time_point now);
+    void apply_pending_discoveries();
     void dispatch_pings(std::chrono::steady_clock::time_point now);
     void dispatch_host_probe(HostEntry& host, std::uint16_t id_tag, std::chrono::steady_clock::time_point now);
     void check_timeouts(std::chrono::steady_clock::time_point now);
@@ -235,6 +201,15 @@ private:
     SortColumn                            sort_column_{SortColumn::None};
     std::vector<NetInterfaceStats>        net_interfaces_;
     std::size_t                           active_net_idx_{0};
+
+    // Background scan state
+    std::atomic<bool>                     scan_in_progress_{false};
+    std::atomic<bool>                     scan_results_ready_{false};
+    std::mutex                            scan_mutex_;
+    std::vector<DiscoveredTarget>         pending_discovered_;
+    std::thread                           scan_thread_;
+    std::string                           status_msg_;
+    std::chrono::steady_clock::time_point status_expiry_{};
 
     // MTR state
     bool                 mtr_active_{false};

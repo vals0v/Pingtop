@@ -262,7 +262,7 @@ int main(int argc, char* argv[]) {
                     break;
                 case 'd':
                 case 'D':
-                    monitor.discover_and_add_network_devices();
+                    monitor.trigger_async_scan();
                     break;
                 case 's':
                 case 'S':

@@ -17,6 +17,7 @@ endif()
 add_executable(pingtop
     src/main.cpp
     src/icmp_socket.cpp
+    src/net_discovery.cpp
     src/network_monitor.cpp
     src/tui_renderer.cpp
 )

@@ -6,19 +6,19 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <numeric>
+#include <optional>
+#include <string_view>
 #include <sys/ioctl.h>
 #include <unistd.h>
-#include <vector>
 
 namespace pingtop {
 
 namespace {
 
 volatile std::sig_atomic_t g_terminate_requested = 0;
-volatile std::sig_atomic_t g_window_resized = 1;
+volatile std::sig_atomic_t g_window_resized = 0;
 
-extern "C" void signal_handler(int sig) noexcept {
+extern "C" void signal_handler(int sig) {
     if (sig == SIGINT || sig == SIGTERM) {
         g_terminate_requested = 1;
     } else if (sig == SIGWINCH) {
@@ -28,6 +28,8 @@ extern "C" void signal_handler(int sig) noexcept {
 
 constexpr const char* kAltScreenEnter = "\033[?1049h";
 constexpr const char* kAltScreenExit  = "\033[?1049l";
+constexpr const char* kLineWrapOff    = "\033[?7l";
+constexpr const char* kLineWrapOn     = "\033[?7h";
 constexpr const char* kCursorHide     = "\033[?25l";
 constexpr const char* kCursorShow     = "\033[?25h";
 constexpr const char* kCursorHome     = "\033[H";
@@ -44,8 +46,8 @@ constexpr const char* kFgYellowGreen  = "\033[38;5;154m";
 constexpr const char* kFgYellow       = "\033[93m";
 constexpr const char* kFgOrange       = "\033[38;5;208m";
 constexpr const char* kFgRed          = "\033[91m";
-constexpr const char* kFgGray         = "\033[90m";
 constexpr const char* kFgMagenta      = "\033[95m";
+constexpr const char* kFgGray         = "\033[90m";
 constexpr const char* kBgHeader       = "\033[48;5;236m";
 constexpr const char* kBgSection      = "\033[48;5;235m";
 constexpr const char* kBgSelected     = "\033[48;5;237m";
@@ -138,7 +140,7 @@ constexpr std::array<const char*, 8> kSparkBlocks = {
     if (kib < 1000.0) {
         std::snprintf(buf, sizeof(buf), "%.1f KiB/s", kib);
     } else if (kib < 1024.0 * 1000.0) {
-        std::snprintf(buf, sizeof(buf), "%.1f MiB/s", kib / 1024.0);
+        std::snprintf(buf, sizeof(buf), "%.2f MiB/s", kib / 1024.0);
     } else {
         std::snprintf(buf, sizeof(buf), "%.2f GiB/s", kib / (1024.0 * 1024.0));
     }
@@ -186,7 +188,6 @@ constexpr std::array<const char*, 8> kSparkBlocks = {
     return fit_string(buf, 5, true);
 }
 
-// Render 1 horizontal row of a multi-row solid block chart using █ and  ▂▃▄▅▆▇█
 void append_block_graph_row(
     std::string& out,
     const RingBuffer<double, NetInterfaceStats::kGraphCapacity>& history,
@@ -229,6 +230,15 @@ void append_block_graph_row(
     }
 }
 
+void append_status_cell(std::string& out, HostStatus status) {
+    switch (status) {
+        case HostStatus::Online:   out.append(kFgGreen).append("● ONLINE"); break;
+        case HostStatus::Offline:  out.append(kFgRed).append("✖ DOWN  "); break;
+        case HostStatus::Pending:  out.append(kFgYellow).append("◌ WAIT  "); break;
+        case HostStatus::DnsError: out.append(kFgRed).append("! DNSERR"); break;
+    }
+}
+
 } // namespace
 
 TuiRenderer::TuiRenderer() noexcept {
@@ -265,12 +275,13 @@ bool TuiRenderer::initialize() noexcept {
 
     std::string init_seq;
     init_seq.append(kAltScreenEnter)
+            .append(kLineWrapOff)
             .append(kCursorHide)
             .append(kClearScreen)
             .append(kCursorHome);
     (void)::write(STDOUT_FILENO, init_seq.data(), init_seq.size());
 
-    update_terminal_size();
+    (void)update_terminal_size();
     initialized_ = true;
     return true;
 }
@@ -282,6 +293,7 @@ void TuiRenderer::shutdown() noexcept {
 
     std::string exit_seq;
     exit_seq.append(kReset)
+            .append(kLineWrapOn)
             .append(kCursorShow)
             .append(kAltScreenExit);
     (void)::write(STDOUT_FILENO, exit_seq.data(), exit_seq.size());
@@ -395,15 +407,17 @@ std::size_t TuiRenderer::selected_host_index(const NetworkMonitor& monitor) cons
     return order[clamped];
 }
 
-void TuiRenderer::update_terminal_size() noexcept {
+bool TuiRenderer::update_terminal_size() noexcept {
     winsize ws{};
     if (::ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
-        term_width_ = std::max(84, static_cast<int>(ws.ws_col));
-        term_height_ = std::max(24, static_cast<int>(ws.ws_row));
-    } else {
-        term_width_ = 120;
-        term_height_ = 38;
+        const int new_w = static_cast<int>(ws.ws_col);
+        const int new_h = static_cast<int>(ws.ws_row);
+        const bool changed = (new_w != term_width_ || new_h != term_height_);
+        term_width_ = new_w;
+        term_height_ = new_h;
+        return changed;
     }
+    return false;
 }
 
 const char* TuiRenderer::latency_color(double rtt_ms) noexcept {
@@ -491,16 +505,57 @@ std::string TuiRenderer::build_sparkline(
     return out;
 }
 
+// btop-style warning screen when terminal window is resized smaller than minimum dimensions
+void TuiRenderer::append_too_small_warning() {
+    const int pad_top = std::max(0, (term_height_ - 7) / 2);
+    for (int r = 0; r < pad_top; ++r) {
+        frame_buffer_.append(kClearLineEnd).append("\n");
+    }
+
+    auto center_pad = [&](int content_len) {
+        const int left = std::max(1, (term_width_ - content_len) / 2);
+        frame_buffer_.append(static_cast<std::size_t>(left), ' ');
+    };
+
+    const char* w_color = (term_width_ < kMinTermWidth) ? kFgRed : kFgGreen;
+    const char* h_color = (term_height_ < kMinTermHeight) ? kFgRed : kFgGreen;
+
+    center_pad(34);
+    frame_buffer_.append(kBold).append(kFgRed).append("⚠  Terminal size too small!").append(kReset).append(kClearLineEnd).append("\n\n");
+
+    char cur_buf[64]{};
+    std::snprintf(cur_buf, sizeof(cur_buf), "Current size : %s%d%s cols x %s%d%s rows",
+                  w_color, term_width_, kFgWhite, h_color, term_height_, kFgWhite);
+    center_pad(32);
+    frame_buffer_.append(kBold).append(kFgWhite).append(cur_buf).append(kReset).append(kClearLineEnd).append("\n");
+
+    char min_buf[64]{};
+    std::snprintf(min_buf, sizeof(min_buf), "Minimum size : %s%d%s cols x %s%d%s rows",
+                  kFgCyan, kMinTermWidth, kFgWhite, kFgCyan, kMinTermHeight, kFgWhite);
+    center_pad(32);
+    frame_buffer_.append(kBold).append(kFgWhite).append(min_buf).append(kReset).append(kClearLineEnd).append("\n\n");
+
+    center_pad(38);
+    frame_buffer_.append(kFgGray).append("Resize window to resume (press q to quit)").append(kReset).append(kClearLineEnd);
+}
+
 void TuiRenderer::render(const NetworkMonitor& monitor) {
-    if (g_window_resized != 0) {
+    const bool size_changed = update_terminal_size();
+    if (g_window_resized != 0 || size_changed) {
         g_window_resized = 0;
-        update_terminal_size();
         frame_buffer_.assign(kClearScreen);
     } else {
         frame_buffer_.clear();
     }
 
     frame_buffer_.append(kCursorHome);
+
+    if (term_width_ < kMinTermWidth || term_height_ < kMinTermHeight) {
+        append_too_small_warning();
+        frame_buffer_.append(kClearToBottom);
+        (void)::write(STDOUT_FILENO, frame_buffer_.data(), frame_buffer_.size());
+        return;
+    }
 
     const auto order = build_visible_order(monitor);
     if (selected_row_ >= order.size() && !order.empty()) {
@@ -555,38 +610,62 @@ void TuiRenderer::append_header(const NetworkMonitor& monitor) {
         ? (static_cast<double>(total_lost) * 100.0 / static_cast<double>(total_completed))
         : 0.0;
 
-    const char* mode_badge = "[VIEW: TABLE]";
+    const char* mode_badge = "[TABLE]";
     if (view_mode_ == ViewMode::Detail) {
-        mode_badge = "[VIEW: 2D GRAPH & PERCENTILES]";
+        mode_badge = "[2D GRAPH]";
     } else if (view_mode_ == ViewMode::Mtr) {
-        mode_badge = "[VIEW: MTR / TRACEROUTE]";
+        mode_badge = "[MTR]";
     }
 
     frame_buffer_.append(kBgTitle).append(kBold).append(kFgWhite);
-    frame_buffer_.append(" ⚡ PINGTOP v1.2 — Network Latency, MTR & Quality Monitor ");
+    if (term_width_ >= 92) {
+        frame_buffer_.append(" ⚡ PINGTOP v1.3 — Network Latency, MTR & Quality Monitor ");
+    } else {
+        frame_buffer_.append(" ⚡ PINGTOP v1.3 ");
+    }
     frame_buffer_.append(kFgCyan).append(" ").append(mode_badge).append(" ");
-    frame_buffer_.append(kFgWhite).append(" [ICMP: ").append(monitor.socket().mode_string()).append("] ");
+    if (term_width_ >= 80) {
+        frame_buffer_.append(kFgWhite).append(" [ICMP: ").append(monitor.socket().mode_string()).append("] ");
+    }
     if (monitor.is_paused()) {
         frame_buffer_.append(kFgYellow).append(kBold).append(" [PAUSED] ");
+    }
+    const std::string status_msg = monitor.status_message();
+    if (!status_msg.empty()) {
+        frame_buffer_.append(kFgYellow).append(kBold).append(" [").append(status_msg).append("] ");
     }
     frame_buffer_.append(kClearLineEnd).append(kReset).append("\n");
 
     char summary_buf[256]{};
-    std::snprintf(
-        summary_buf,
-        sizeof(summary_buf),
-        " Hosts: %zu (%zu up / %zu down) │ Mean RTT: %.1f ms │ Loss: %.1f%% │ Int: %lld ms │ Sort: %.*s │ Group: %s │ Uptime: %s",
-        hosts.size(),
-        online_count,
-        offline_count,
-        mean_rtt,
-        global_loss,
-        static_cast<long long>(monitor.config().ping_interval.count()),
-        static_cast<int>(monitor.sort_column_name().size()),
-        monitor.sort_column_name().data(),
-        group_by_category_ ? "ON" : "OFF",
-        format_uptime(monitor.start_time()).c_str()
-    );
+    if (term_width_ >= 96) {
+        std::snprintf(
+            summary_buf,
+            sizeof(summary_buf),
+            " Hosts: %zu (%zu up/%zu down) │ Mean: %.1f ms │ Loss: %.1f%% │ Int: %lld ms │ Sort: %.*s │ Uptime: %s",
+            hosts.size(),
+            online_count,
+            offline_count,
+            mean_rtt,
+            global_loss,
+            static_cast<long long>(monitor.config().ping_interval.count()),
+            static_cast<int>(monitor.sort_column_name().size()),
+            monitor.sort_column_name().data(),
+            format_uptime(monitor.start_time()).c_str()
+        );
+    } else {
+        std::snprintf(
+            summary_buf,
+            sizeof(summary_buf),
+            " Hosts: %zu (%zu/%zu) │ Mean: %.1fms │ Loss: %.1f%% │ Int: %lldms │ Up: %s",
+            hosts.size(),
+            online_count,
+            offline_count,
+            mean_rtt,
+            global_loss,
+            static_cast<long long>(monitor.config().ping_interval.count()),
+            format_uptime(monitor.start_time()).c_str()
+        );
+    }
 
     frame_buffer_.append(kBold).append(kFgWhite).append(summary_buf).append(kReset).append(kClearLineEnd).append("\n");
 
@@ -598,13 +677,20 @@ void TuiRenderer::append_header(const NetworkMonitor& monitor) {
 }
 
 void TuiRenderer::append_host_row(const HostEntry& h, bool is_selected, std::size_t spark_width) {
+    const bool wide_layout   = (term_width_ >= 104);
+    const bool medium_layout = (term_width_ >= 82 && term_width_ < 104);
+    const std::size_t name_w = wide_layout ? 18 : 15;
+
     if (is_selected) {
         frame_buffer_.append(kBgSelected).append(kBold);
     }
 
     frame_buffer_.append(is_selected ? "\033[96m▸" : " ");
-    frame_buffer_.append(kFgWhite).append(fit_string(h.display_name, 18)).append(" ");
-    frame_buffer_.append(kFgGray).append(fit_string(h.resolved_ip, 15)).append(" ");
+    frame_buffer_.append(kFgWhite).append(fit_string(h.display_name, name_w)).append(" ");
+
+    if (wide_layout || medium_layout) {
+        frame_buffer_.append(kFgGray).append(fit_string(h.resolved_ip, 15)).append(" ");
+    }
 
     const char* proto_color = kFgCyan;
     if (h.probe_type == ProbeType::Tcp) {
@@ -614,16 +700,9 @@ void TuiRenderer::append_host_row(const HostEntry& h, bool is_selected, std::siz
     } else if (h.is_ipv6) {
         proto_color = kFgYellowGreen;
     }
-    frame_buffer_.append(proto_color)
-                 .append(fit_string(format_probe_badge(h), 7))
-                 .append(" ");
+    frame_buffer_.append(proto_color).append(fit_string(format_probe_badge(h), 7)).append(" ");
 
-    switch (h.status) {
-        case HostStatus::Online:   frame_buffer_.append(kFgGreen).append(fit_string("● ONLINE", 8)); break;
-        case HostStatus::Offline:  frame_buffer_.append(kFgRed).append(fit_string("✖ DOWN  ", 8)); break;
-        case HostStatus::Pending:  frame_buffer_.append(kFgYellow).append(fit_string("◌ WAIT  ", 8)); break;
-        case HostStatus::DnsError: frame_buffer_.append(kFgRed).append(fit_string("! DNSERR", 8)); break;
-    }
+    append_status_cell(frame_buffer_, h.status);
     frame_buffer_.append(" ");
 
     const double loss = h.packet_loss_percent();
@@ -638,22 +717,28 @@ void TuiRenderer::append_host_row(const HostEntry& h, bool is_selected, std::siz
                  .append(format_metric(h.last_rtt_ms, last_valid, 6))
                  .append(" ");
 
-    frame_buffer_.append(has_samples ? latency_color(h.min_rtt_ms) : kFgGray)
-                 .append(format_metric(h.min_rtt_ms, has_samples, 6))
-                 .append(" ");
+    if (wide_layout) {
+        frame_buffer_.append(has_samples ? latency_color(h.min_rtt_ms) : kFgGray)
+                     .append(format_metric(h.min_rtt_ms, has_samples, 6))
+                     .append(" ");
+    }
 
     frame_buffer_.append(has_samples ? latency_color(h.avg_rtt_ms) : kFgGray)
-                 .append(format_metric(h.avg_rtt_ms, has_samples, 6))
-                 .append(" ");
+                 .append(format_metric(h.avg_rtt_ms, has_samples, 6));
 
-    frame_buffer_.append(has_samples ? latency_color(h.max_rtt_ms) : kFgGray)
-                 .append(format_metric(h.max_rtt_ms, has_samples, 6))
-                 .append(" ");
+    if (wide_layout) {
+        frame_buffer_.append(" ")
+                     .append(has_samples ? latency_color(h.max_rtt_ms) : kFgGray)
+                     .append(format_metric(h.max_rtt_ms, has_samples, 6));
+    }
 
-    frame_buffer_.append(has_samples ? jitter_color(h.jitter_ms) : kFgGray)
-                 .append(format_metric(h.jitter_ms, has_samples, 6))
-                 .append("  ");
+    if (wide_layout || medium_layout) {
+        frame_buffer_.append(" ")
+                     .append(has_samples ? jitter_color(h.jitter_ms) : kFgGray)
+                     .append(format_metric(h.jitter_ms, has_samples, 6));
+    }
 
+    frame_buffer_.append("  ");
     frame_buffer_.append(build_sparkline(h.history, spark_width));
     frame_buffer_.append(kClearLineEnd).append(kReset).append("\n");
 }
@@ -661,39 +746,43 @@ void TuiRenderer::append_host_row(const HostEntry& h, bool is_selected, std::siz
 void TuiRenderer::append_table_view(const NetworkMonitor& monitor, const std::vector<std::size_t>& order) {
     const auto& hosts = monitor.hosts();
 
-    constexpr int kFixedColsWidth = 91;
+    const bool wide_layout   = (term_width_ >= 104);
+    const bool medium_layout = (term_width_ >= 82 && term_width_ < 104);
+    const std::size_t name_w = wide_layout ? 18 : 15;
+    const int fixed_cols     = wide_layout ? 91 : (medium_layout ? 74 : 51);
+
     const std::size_t spark_width = static_cast<std::size_t>(
-        std::clamp(term_width_ - kFixedColsWidth, 10, static_cast<int>(HostEntry::kHistoryCapacity))
+        std::clamp(term_width_ - fixed_cols, 6, static_cast<int>(HostEntry::kHistoryCapacity))
     );
 
-    frame_buffer_.append(kBgHeader).append(kBold).append(kFgCyan);
-    frame_buffer_.append(" ")
-                 .append(fit_string("TARGET", 18))
-                 .append(" ")
-                 .append(fit_string("IP ADDRESS", 15))
-                 .append(" ")
-                 .append(fit_string("PROTO", 7))
-                 .append(" ")
-                 .append(fit_string("STATUS", 8))
-                 .append(" ")
-                 .append(fit_string("LOSS%", 6, true))
-                 .append(" ")
-                 .append(fit_string("LAST", 6, true))
-                 .append(" ")
-                 .append(fit_string("MIN", 6, true))
-                 .append(" ")
-                 .append(fit_string("AVG", 6, true))
-                 .append(" ")
-                 .append(fit_string("MAX", 6, true))
-                 .append(" ")
-                 .append(fit_string("JITTER", 6, true))
-                 .append("  ")
-                 .append(fit_string("LATENCY SPARKLINE (ms)", spark_width))
+    frame_buffer_.append(kBgHeader).append(kBold).append(kFgCyan).append(" ");
+    frame_buffer_.append(fit_string("TARGET", name_w)).append(" ");
+    if (wide_layout || medium_layout) {
+        frame_buffer_.append(fit_string("IP ADDRESS", 15)).append(" ");
+    }
+    frame_buffer_.append(fit_string("PROTO", 7)).append(" ")
+                 .append(fit_string("STATUS", 8)).append(" ")
+                 .append(fit_string("LOSS%", 6, true)).append(" ")
+                 .append(fit_string("LAST", 6, true)).append(" ");
+    if (wide_layout) {
+        frame_buffer_.append(fit_string("MIN", 6, true)).append(" ");
+    }
+    frame_buffer_.append(fit_string("AVG", 6, true));
+    if (wide_layout) {
+        frame_buffer_.append(" ").append(fit_string("MAX", 6, true));
+    }
+    if (wide_layout || medium_layout) {
+        frame_buffer_.append(" ").append(fit_string("JITTER", 6, true));
+    }
+    frame_buffer_.append("  ")
+                 .append(fit_string("SPARKLINE", spark_width))
                  .append(kClearLineEnd)
                  .append(kReset)
                  .append("\n");
 
-    const std::size_t max_body_lines = static_cast<std::size_t>(std::max(10, term_height_ - 14));
+    // Strict height budget: 4 header lines + footer_lines (12 when height>=24, 4 when compact)
+    const int footer_lines = (term_height_ >= 24) ? 12 : 4;
+    const std::size_t max_body_lines = static_cast<std::size_t>(std::max(4, term_height_ - 4 - footer_lines));
     std::size_t lines_used = 0;
 
     if (order.empty()) {
@@ -706,7 +795,6 @@ void TuiRenderer::append_table_view(const NetworkMonitor& monitor, const std::ve
                      .append("\n");
         ++lines_used;
     } else {
-        // Compute scroll offset so selected_row_ is always visible inside max_body_lines
         const std::size_t approx_rows_per_screen = (max_body_lines > 3) ? (max_body_lines - 3) : max_body_lines;
         std::size_t start_row = 0;
         if (selected_row_ >= approx_rows_per_screen) {
@@ -736,7 +824,7 @@ void TuiRenderer::append_table_view(const NetworkMonitor& monitor, const std::ve
         }
     }
 
-    while (lines_used < std::min<std::size_t>(hosts.size() + 4, max_body_lines)) {
+    while (lines_used < max_body_lines) {
         frame_buffer_.append(kClearLineEnd).append("\n");
         ++lines_used;
     }
@@ -749,43 +837,42 @@ void TuiRenderer::append_detail_view(const NetworkMonitor& monitor, const std::v
         return;
     }
 
-    const HostEntry& h = hosts[order[std::min(selected_row_, order.size() - 1)]];
+    const HostEntry& h = hosts[selected_host_index(monitor)];
     const LatencyPercentiles pct = h.compute_percentiles();
 
-    // 1. Target banner & Percentile cards
-    frame_buffer_.append(kBgHeader).append(kBold).append(kFgCyan)
-                 .append(" 📊 DETAILED ANALYTICS: ").append(kFgWhite).append(h.display_name)
+    frame_buffer_.append(kBgSection).append(kBold).append(kFgCyan)
+                 .append(" 📊 DETAILED TELEMETRY: ")
+                 .append(kFgWhite).append(h.display_name)
                  .append(" (").append(h.resolved_ip).append(") ")
-                 .append(kFgMagenta).append("[").append(format_probe_badge(h)).append("]")
-                 .append(kFgGray).append("  — Press Enter or b to return to Table")
+                 .append(kFgYellow).append("[").append(format_probe_badge(h)).append("]")
+                 .append(kFgGray).append("  — Press Enter or b to return")
                  .append(kClearLineEnd).append(kReset).append("\n");
 
-    char diag_buf[256]{};
+    char meta_buf[256]{};
     std::snprintf(
-        diag_buf,
-        sizeof(diag_buf),
-        " GeoIP / ASN: %s  │  Path MTU: %u B (press 'm' to probe DF MTU)  │  Stack: %s  │  Last TTL: %u",
+        meta_buf,
+        sizeof(meta_buf),
+        " Geo / ASN: %-24s │ Path MTU: %u bytes │ Last TTL: %u │ Sent: %llu  Recv: %llu  Loss: %.1f%%",
         h.asn_info.empty() ? "---" : h.asn_info.c_str(),
         static_cast<unsigned int>(h.path_mtu),
-        h.is_ipv6 ? "IPv6" : "IPv4",
-        static_cast<unsigned int>(h.last_ttl)
+        static_cast<unsigned int>(h.last_ttl),
+        static_cast<unsigned long long>(h.sent_count),
+        static_cast<unsigned long long>(h.received_count),
+        h.packet_loss_percent()
     );
-    frame_buffer_.append(kBold).append(kFgCyan).append(diag_buf).append(kReset).append(kClearLineEnd).append("\n");
+    frame_buffer_.append(kFgWhite).append(meta_buf).append(kReset).append(kClearLineEnd).append("\n");
 
-    char p_buf[256]{};
+    char pct_buf[256]{};
     std::snprintf(
-        p_buf,
-        sizeof(p_buf),
-        " Percentiles:  p50 (Median): %.2f ms  │  p90: %.2f ms  │  p95: %.2f ms  │  p99: %.2f ms  │  StdDev (σ): %.2f ms  │  Jitter: %.2f ms",
-        pct.p50, pct.p90, pct.p95, pct.p99, pct.stddev, h.jitter_ms
+        pct_buf,
+        sizeof(pct_buf),
+        " Percentiles:  p50 (Median): %.2f ms │ p90: %.2f ms │ p95: %.2f ms │ p99: %.2f ms │ StdDev (σ): %.2f ms",
+        pct.p50, pct.p90, pct.p95, pct.p99, pct.stddev
     );
-    frame_buffer_.append(kBold).append(kFgYellow).append(p_buf).append(kReset).append(kClearLineEnd).append("\n\n");
+    frame_buffer_.append(kBold).append(kFgCyan).append(pct_buf).append(kReset).append(kClearLineEnd).append("\n\n");
 
-    // 2. 2D Multi-line Latency Chart (8 rows tall)
-    constexpr int kChartHeight = 8;
-    const std::size_t chart_width = static_cast<std::size_t>(
-        std::clamp(term_width_ - 16, 20, static_cast<int>(HostEntry::kHistoryCapacity))
-    );
+    const int chart_height = (term_height_ >= 30) ? 7 : 4;
+    const std::size_t chart_width = static_cast<std::size_t>(std::clamp(term_width_ - 16, 20, 60));
     const std::size_t hist_size = h.history.size();
     const std::size_t visible = std::min(hist_size, chart_width);
     const std::size_t start_idx = hist_size - visible;
@@ -802,9 +889,9 @@ void TuiRenderer::append_detail_view(const NetworkMonitor& monitor, const std::v
                  .append(" 2D Latency History Graph (last ").append(std::to_string(visible)).append(" samples):")
                  .append(kReset).append(kClearLineEnd).append("\n");
 
-    for (int row = kChartHeight - 1; row >= 0; --row) {
-        const double row_threshold = (static_cast<double>(row) / static_cast<double>(kChartHeight)) * max_rtt;
-        const double row_top = (static_cast<double>(row + 1) / static_cast<double>(kChartHeight)) * max_rtt;
+    for (int row = chart_height - 1; row >= 0; --row) {
+        const double row_threshold = (static_cast<double>(row) / static_cast<double>(chart_height)) * max_rtt;
+        const double row_top = (static_cast<double>(row + 1) / static_cast<double>(chart_height)) * max_rtt;
 
         char y_label[16]{};
         std::snprintf(y_label, sizeof(y_label), "%7.1f ms │ ", row_top);
@@ -831,56 +918,7 @@ void TuiRenderer::append_detail_view(const NetworkMonitor& monitor, const std::v
     for (std::size_t i = 0; i < visible + 1; ++i) {
         frame_buffer_.append("─");
     }
-    frame_buffer_.append(kReset).append(kClearLineEnd).append("\n\n");
-
-    // 3. Latency Distribution Histogram
-    frame_buffer_.append(kBold).append(kFgCyan)
-                 .append(" Latency Distribution Histogram:")
-                 .append(kReset).append(kClearLineEnd).append("\n");
-
-    struct Bucket {
-        const char* label;
-        double low;
-        double high;
-        const char* color;
-        std::size_t count{0};
-    };
-
-    std::array<Bucket, 5> buckets = {{
-        {"  0 -  25 ms", 0.0,   25.0,  kFgGreen,       0},
-        {" 25 -  60 ms", 25.0,  60.0,  kFgYellowGreen, 0},
-        {" 60 - 120 ms", 60.0,  120.0, kFgYellow,      0},
-        {"120 - 220 ms", 120.0, 220.0, kFgOrange,      0},
-        {"  >= 220 ms ", 220.0, 1e9,   kFgRed,         0}
-    }};
-
-    std::size_t valid_total = 0;
-    for (double v : h.history) {
-        if (v >= 0.0) {
-            ++valid_total;
-            for (auto& b : buckets) {
-                if (v >= b.low && v < b.high) {
-                    ++b.count;
-                    break;
-                }
-            }
-        }
-    }
-
-    for (const auto& b : buckets) {
-        const double ratio = (valid_total > 0)
-            ? (static_cast<double>(b.count) / static_cast<double>(valid_total))
-            : 0.0;
-        const int bar_cells = static_cast<int>(std::llround(ratio * 30.0));
-
-        frame_buffer_.append("  ").append(kFgWhite).append(b.label).append(" │ ").append(b.color);
-        for (int c = 0; c < 30; ++c) {
-            frame_buffer_.append(c < bar_cells ? "█" : "\033[90m░");
-        }
-        char stat_buf[48]{};
-        std::snprintf(stat_buf, sizeof(stat_buf), " %5.1f%% (%zu)", ratio * 100.0, b.count);
-        frame_buffer_.append(kReset).append(kFgWhite).append(stat_buf).append(kReset).append(kClearLineEnd).append("\n");
-    }
+    frame_buffer_.append(kReset).append(kClearLineEnd).append("\n");
 }
 
 void TuiRenderer::append_mtr_view(const NetworkMonitor& monitor) {
@@ -894,27 +932,19 @@ void TuiRenderer::append_mtr_view(const NetworkMonitor& monitor) {
 
     constexpr int kFixedColsWidth = 88;
     const std::size_t spark_width = static_cast<std::size_t>(
-        std::clamp(term_width_ - kFixedColsWidth, 10, static_cast<int>(HostEntry::kHistoryCapacity))
+        std::clamp(term_width_ - kFixedColsWidth, 8, static_cast<int>(HostEntry::kHistoryCapacity))
     );
 
-    frame_buffer_.append(kBgSection).append(kBold).append(kFgCyan);
-    frame_buffer_.append(" ")
-                 .append(fit_string("HOP", 14))
+    frame_buffer_.append(kBgSection).append(kBold).append(kFgCyan)
                  .append(" ")
-                 .append(fit_string("HOP IP", 15))
-                 .append(" ")
-                 .append(fit_string("GEO / ASN / ISP", 20))
-                 .append(" ")
-                 .append(fit_string("STATUS", 8))
-                 .append(" ")
-                 .append(fit_string("LOSS%", 6, true))
-                 .append(" ")
-                 .append(fit_string("LAST", 6, true))
-                 .append(" ")
-                 .append(fit_string("AVG", 6, true))
-                 .append(" ")
-                 .append(fit_string("JITTER", 6, true))
-                 .append("  ")
+                 .append(fit_string("HOP", 14)).append(" ")
+                 .append(fit_string("HOP IP", 15)).append(" ")
+                 .append(fit_string("GEO / ASN / ISP", 20)).append(" ")
+                 .append(fit_string("STATUS", 8)).append(" ")
+                 .append(fit_string("LOSS%", 6, true)).append(" ")
+                 .append(fit_string("LAST", 6, true)).append(" ")
+                 .append(fit_string("AVG", 6, true)).append(" ")
+                 .append(fit_string("JITTER", 6, true)).append("  ")
                  .append(fit_string("HOP SPARKLINE", spark_width))
                  .append(kClearLineEnd).append(kReset).append("\n");
 
@@ -933,12 +963,7 @@ void TuiRenderer::append_mtr_view(const NetworkMonitor& monitor) {
                          .append(kFgGray).append(fit_string(h.resolved_ip, 15)).append(" ")
                          .append(kFgYellow).append(fit_string(h.asn_info.empty() ? "---" : h.asn_info, 20)).append(" ");
 
-            switch (h.status) {
-                case HostStatus::Online:   frame_buffer_.append(kFgGreen).append(fit_string("● ONLINE", 8)); break;
-                case HostStatus::Offline:  frame_buffer_.append(kFgRed).append(fit_string("✖ DOWN  ", 8)); break;
-                case HostStatus::Pending:  frame_buffer_.append(kFgYellow).append(fit_string("◌ WAIT  ", 8)); break;
-                case HostStatus::DnsError: frame_buffer_.append(kFgRed).append(fit_string("! DNSERR", 8)); break;
-            }
+            append_status_cell(frame_buffer_, h.status);
             frame_buffer_.append(" ");
 
             const double loss = h.packet_loss_percent();
@@ -963,18 +988,18 @@ void TuiRenderer::append_mtr_view(const NetworkMonitor& monitor) {
 }
 
 void TuiRenderer::append_footer(const NetworkMonitor& monitor, const std::vector<std::size_t>& order) {
-    constexpr const char* kBorderColor = "\033[38;5;239m"; // Pingtop slate-gray box border
-    constexpr const char* kBgKeyBar     = "\033[48;5;238m";
-    const std::size_t W = static_cast<std::size_t>(std::max(84, term_width_));
+    constexpr const char* kBorderColor = "\033[38;5;239m";
+    constexpr const char* kBgKeyBar    = "\033[48;5;238m";
+    const std::size_t W = static_cast<std::size_t>(std::max(kMinTermWidth, term_width_));
 
     // 1. Selected Host Telemetry Bar / Search Input
     if (search_active_ || !filter_query_.empty()) {
         frame_buffer_.append("\033[48;5;23m").append(kBold).append(kFgWhite)
                      .append(" 🔍 Filter: ").append(kFgYellow).append(filter_query_);
         if (search_active_) {
-            frame_buffer_.append("█  (Type to filter, Enter to lock, Esc to clear)");
+            frame_buffer_.append("█  (Enter to lock, Esc to clear)");
         } else {
-            frame_buffer_.append("   (Press '/' to edit filter, Esc to clear)");
+            frame_buffer_.append("   ('/' to edit, Esc to clear)");
         }
         frame_buffer_.append(kClearLineEnd).append(kReset).append("\n");
     } else if (!order.empty()) {
@@ -994,7 +1019,7 @@ void TuiRenderer::append_footer(const NetworkMonitor& monitor, const std::vector
             pct.p99,
             static_cast<unsigned int>(sel.last_ttl)
         );
-        frame_buffer_.append(kFgCyan).append(detail_buf).append(kReset).append(kClearLineEnd).append("\n");
+        frame_buffer_.append(kFgCyan).append(fit_string(detail_buf, W)).append(kReset).append(kClearLineEnd).append("\n");
     } else {
         frame_buffer_.append(kFgGray).append(" No host selected").append(kReset).append(kClearLineEnd).append("\n");
     }
@@ -1008,42 +1033,6 @@ void TuiRenderer::append_footer(const NetworkMonitor& monitor, const std::vector
         ? fallback_net
         : net_list[std::min(monitor.active_net_index(), net_list.size() - 1)];
 
-    // Section header banner in Pingtop style
-    const std::string iface_banner = " ▼ [ NETWORK TRAFFIC & INTERFACE: " + net.name + " (" + net.ipv4 + ") ] ";
-    const std::string iface_nav    = " [ < / > Switch Iface │ z Reset ] ";
-    frame_buffer_.append(kBgSection).append(kBold).append(kFgYellow).append(iface_banner).append(kReset);
-
-    const std::size_t banner_cols = iface_banner.size();
-    const std::size_t nav_cols    = iface_nav.size();
-    if (W > banner_cols + nav_cols) {
-        frame_buffer_.append(kFgGray);
-        for (std::size_t i = 0; i < (W - banner_cols - nav_cols); ++i) {
-            frame_buffer_.append("─");
-        }
-        frame_buffer_.append(kFgCyan).append(iface_nav).append(kReset);
-    }
-    frame_buffer_.append(kClearLineEnd).append("\n");
-
-    // 3. Dual Solid Block Chart & Telemetry Box
-    // Width allocation: left │ (1) + left_width + mid │ (1) + info_width (34) + right │ (1) = W
-    constexpr std::size_t kInfoWidth = 34;
-    const std::size_t left_width = (W > kInfoWidth + 3) ? (W - kInfoWidth - 3) : 40;
-    const std::size_t graph_cols = (left_width > 7) ? (left_width - 7) : 10;
-
-    double rx_max = 32.0 * 1024.0;
-    for (double v : net.rx_history) {
-        rx_max = std::max(rx_max, v * 1.15);
-    }
-    double tx_max = 32.0 * 1024.0;
-    for (double v : net.tx_history) {
-        tx_max = std::max(tx_max, v * 1.15);
-    }
-
-    const std::string rx_scale_top = format_scale_label(rx_max);
-    const std::string rx_scale_mid = format_scale_label(rx_max * 0.5);
-    const std::string tx_scale_top = format_scale_label(tx_max);
-    const std::string tx_scale_mid = format_scale_label(tx_max * 0.5);
-
     const std::string rx_rate_str  = format_byte_rate(net.rx_speed_bps);
     const std::string rx_bits_str  = format_bit_rate_parens(net.rx_speed_bps);
     const std::string rx_top_str   = format_byte_rate(net.rx_top_bps);
@@ -1054,127 +1043,183 @@ void TuiRenderer::append_footer(const NetworkMonitor& monitor, const std::vector
     const std::string tx_top_str   = format_byte_rate(net.tx_top_bps);
     const std::string tx_total_str = format_total_bytes(net.tx_total);
 
-    auto format_side_cell = [](const char* label, const std::string& val) {
-        char buf[64]{};
-        std::snprintf(buf, sizeof(buf), "%-14s %18s", label, val.c_str());
-        return std::string(buf);
-    };
+    // Compact vertical fallback when terminal height < 24 rows
+    if (term_height_ < 24) {
+        const std::string compact_hdr = " ▼ [ NET: " + net.name + " (" + net.ipv4 + ") ] ";
+        frame_buffer_.append(kBgSection).append(kBold).append(kFgYellow).append(compact_hdr)
+                     .append(kFgCyan).append(" ▼ DL: ").append(rx_rate_str).append(" (Tot: ").append(rx_total_str).append(") ")
+                     .append(kFgOrange).append(" ▲ UL: ").append(tx_rate_str).append(" (Tot: ").append(tx_total_str).append(")")
+                     .append(kClearLineEnd).append(kReset).append("\n");
+    } else {
+        const std::string iface_banner = " ▼ [ NETWORK TRAFFIC & INTERFACE: " + net.name + " (" + net.ipv4 + ") ] ";
+        const std::string iface_nav    = " [ < / > Switch Iface │ z Reset ] ";
+        frame_buffer_.append(kBgSection).append(kBold).append(kFgYellow).append(iface_banner).append(kReset);
 
-    // Box Top Border: ┌─────┬─────┐
-    frame_buffer_.append(kBorderColor).append("┌");
-    for (std::size_t i = 0; i < left_width; ++i) frame_buffer_.append("─");
-    frame_buffer_.append("┬");
-    for (std::size_t i = 0; i < kInfoWidth; ++i) frame_buffer_.append("─");
-    frame_buffer_.append("┐").append(kReset).append(kClearLineEnd).append("\n");
-
-    // Row 1: Download Header line
-    {
-        frame_buffer_.append(kBorderColor).append("│ ").append(kReset);
-        std::string dl_hdr = "DOWNLOAD: " + rx_rate_str + " " + rx_bits_str;
-        if (left_width >= 56) {
-            dl_hdr += "   Peak: " + rx_top_str;
+        const std::size_t banner_cols = iface_banner.size() - 2; // ▼ is 3 UTF-8 bytes, 1 col
+        const std::size_t nav_cols    = iface_nav.size() - 2;    // │ is 3 UTF-8 bytes, 1 col
+        if (W > banner_cols + nav_cols) {
+            frame_buffer_.append(kFgGray);
+            for (std::size_t i = 0; i < (W - banner_cols - nav_cols); ++i) {
+                frame_buffer_.append("─");
+            }
+            frame_buffer_.append(kFgCyan).append(iface_nav).append(kReset);
         }
-        const std::size_t dl_avail = (left_width > 3) ? (left_width - 3) : 10;
-        frame_buffer_.append(kFgCyan).append("▼ ").append(fit_string(dl_hdr, dl_avail)).append(kReset);
-        frame_buffer_.append(kBorderColor).append("│ ").append(kReset);
+        frame_buffer_.append(kClearLineEnd).append("\n");
 
-        frame_buffer_.append(kBold).append(kFgWhite).append(format_side_cell("Total Recv:", rx_total_str)).append(kReset);
-        frame_buffer_.append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
-    }
+        const bool show_side_box = (W >= 82);
+        constexpr std::size_t kInfoWidth = 34;
+        const std::size_t left_width = show_side_box ? (W - kInfoWidth - 3) : (W - 2);
+        const std::size_t graph_cols = (left_width > 7) ? (left_width - 7) : 10;
 
-    // Row 2: Download Graph Top Row (row 1 of 2)
-    {
-        frame_buffer_.append(kBorderColor).append("│").append(kReset);
-        frame_buffer_.append(kFgGray).append(fit_string(rx_scale_top, 5)).append(" │").append(kReset);
-        append_block_graph_row(frame_buffer_, net.rx_history, graph_cols, 1, 2, rx_max, kFgCyan);
-        frame_buffer_.append(kReset).append(kBorderColor).append("│ ").append(kReset);
-
-        frame_buffer_.append(kFgCyan).append(format_side_cell("Current Rate:", rx_rate_str)).append(kReset);
-        frame_buffer_.append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
-    }
-
-    // Row 3: Download Graph Bottom Row (row 0 of 2)
-    {
-        frame_buffer_.append(kBorderColor).append("│").append(kReset);
-        frame_buffer_.append(kFgGray).append(fit_string(rx_scale_mid, 5)).append(" │").append(kReset);
-        append_block_graph_row(frame_buffer_, net.rx_history, graph_cols, 0, 2, rx_max, kFgCyan);
-        frame_buffer_.append(kReset).append(kBorderColor).append("│ ").append(kReset);
-
-        frame_buffer_.append(kFgGray).append(format_side_cell("Peak Rate:", rx_top_str)).append(kReset);
-        frame_buffer_.append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
-    }
-
-    // Row 4: Baseline + Middle Divider: ├─────┼─────┤
-    {
-        frame_buffer_.append(kBorderColor).append("├").append(kFgGray).append("   0B └");
-        for (std::size_t i = 0; i < graph_cols; ++i) frame_buffer_.append("─");
-        frame_buffer_.append(kBorderColor).append("┼");
-        for (std::size_t i = 0; i < kInfoWidth; ++i) frame_buffer_.append("─");
-        frame_buffer_.append("┤").append(kReset).append(kClearLineEnd).append("\n");
-    }
-
-    // Row 5: Upload Header line
-    {
-        frame_buffer_.append(kBorderColor).append("│ ").append(kReset);
-        std::string ul_hdr = "UPLOAD:   " + tx_rate_str + " " + tx_bits_str;
-        if (left_width >= 56) {
-            ul_hdr += "   Peak: " + tx_top_str;
+        double rx_max = 32.0 * 1024.0;
+        for (double v : net.rx_history) {
+            rx_max = std::max(rx_max, v * 1.15);
         }
-        const std::size_t ul_avail = (left_width > 3) ? (left_width - 3) : 10;
-        frame_buffer_.append(kFgOrange).append("▲ ").append(fit_string(ul_hdr, ul_avail)).append(kReset);
-        frame_buffer_.append(kBorderColor).append("│ ").append(kReset);
+        double tx_max = 32.0 * 1024.0;
+        for (double v : net.tx_history) {
+            tx_max = std::max(tx_max, v * 1.15);
+        }
 
-        frame_buffer_.append(kBold).append(kFgWhite).append(format_side_cell("Total Sent:", tx_total_str)).append(kReset);
-        frame_buffer_.append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
+        const std::string rx_scale_top = format_scale_label(rx_max);
+        const std::string rx_scale_mid = format_scale_label(rx_max * 0.5);
+        const std::string tx_scale_top = format_scale_label(tx_max);
+        const std::string tx_scale_mid = format_scale_label(tx_max * 0.5);
+
+        auto format_side_cell = [](const char* label, const std::string& val) {
+            char buf[64]{};
+            std::snprintf(buf, sizeof(buf), "%-14s %18s", label, val.c_str());
+            return std::string(buf);
+        };
+
+        // Top Border
+        frame_buffer_.append(kBorderColor).append("┌");
+        for (std::size_t i = 0; i < left_width; ++i) frame_buffer_.append("─");
+        if (show_side_box) {
+            frame_buffer_.append("┬");
+            for (std::size_t i = 0; i < kInfoWidth; ++i) frame_buffer_.append("─");
+        }
+        frame_buffer_.append("┐").append(kReset).append(kClearLineEnd).append("\n");
+
+        // Row 1: Download Header
+        {
+            frame_buffer_.append(kBorderColor).append("│ ").append(kReset);
+            std::string dl_hdr = "DOWNLOAD: " + rx_rate_str + " " + rx_bits_str;
+            if (left_width >= 56) {
+                dl_hdr += "   Peak: " + rx_top_str;
+            }
+            const std::size_t dl_avail = (left_width > 3) ? (left_width - 3) : 10;
+            frame_buffer_.append(kFgCyan).append("▼ ").append(fit_string(dl_hdr, dl_avail)).append(kReset);
+            if (show_side_box) {
+                frame_buffer_.append(kBorderColor).append("│ ").append(kReset);
+                frame_buffer_.append(kBold).append(kFgWhite).append(format_side_cell("Total Recv:", rx_total_str)).append(kReset);
+            }
+            frame_buffer_.append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
+        }
+
+        // Row 2: Download Graph Top
+        {
+            frame_buffer_.append(kBorderColor).append("│").append(kReset);
+            frame_buffer_.append(kFgGray).append(fit_string(rx_scale_top, 5)).append(" │").append(kReset);
+            append_block_graph_row(frame_buffer_, net.rx_history, graph_cols, 1, 2, rx_max, kFgCyan);
+            if (show_side_box) {
+                frame_buffer_.append(kReset).append(kBorderColor).append("│ ").append(kReset);
+                frame_buffer_.append(kFgCyan).append(format_side_cell("Current Rate:", rx_rate_str)).append(kReset);
+            }
+            frame_buffer_.append(kReset).append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
+        }
+
+        // Row 3: Download Graph Bottom
+        {
+            frame_buffer_.append(kBorderColor).append("│").append(kReset);
+            frame_buffer_.append(kFgGray).append(fit_string(rx_scale_mid, 5)).append(" │").append(kReset);
+            append_block_graph_row(frame_buffer_, net.rx_history, graph_cols, 0, 2, rx_max, kFgCyan);
+            if (show_side_box) {
+                frame_buffer_.append(kReset).append(kBorderColor).append("│ ").append(kReset);
+                frame_buffer_.append(kFgGray).append(format_side_cell("Peak Rate:", rx_top_str)).append(kReset);
+            }
+            frame_buffer_.append(kReset).append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
+        }
+
+        // Row 4: Middle Divider
+        {
+            frame_buffer_.append(kBorderColor).append("├").append(kFgGray).append("   0B └");
+            for (std::size_t i = 0; i < graph_cols; ++i) frame_buffer_.append("─");
+            if (show_side_box) {
+                frame_buffer_.append(kBorderColor).append("┼");
+                for (std::size_t i = 0; i < kInfoWidth; ++i) frame_buffer_.append("─");
+            }
+            frame_buffer_.append(kBorderColor).append("┤").append(kReset).append(kClearLineEnd).append("\n");
+        }
+
+        // Row 5: Upload Header
+        {
+            frame_buffer_.append(kBorderColor).append("│ ").append(kReset);
+            std::string ul_hdr = "UPLOAD:   " + tx_rate_str + " " + tx_bits_str;
+            if (left_width >= 56) {
+                ul_hdr += "   Peak: " + tx_top_str;
+            }
+            const std::size_t ul_avail = (left_width > 3) ? (left_width - 3) : 10;
+            frame_buffer_.append(kFgOrange).append("▲ ").append(fit_string(ul_hdr, ul_avail)).append(kReset);
+            if (show_side_box) {
+                frame_buffer_.append(kBorderColor).append("│ ").append(kReset);
+                frame_buffer_.append(kBold).append(kFgWhite).append(format_side_cell("Total Sent:", tx_total_str)).append(kReset);
+            }
+            frame_buffer_.append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
+        }
+
+        // Row 6: Upload Graph Top
+        {
+            frame_buffer_.append(kBorderColor).append("│").append(kReset);
+            frame_buffer_.append(kFgGray).append(fit_string(tx_scale_top, 5)).append(" │").append(kReset);
+            append_block_graph_row(frame_buffer_, net.tx_history, graph_cols, 1, 2, tx_max, kFgOrange);
+            if (show_side_box) {
+                frame_buffer_.append(kReset).append(kBorderColor).append("│ ").append(kReset);
+                frame_buffer_.append(kFgOrange).append(format_side_cell("Current Rate:", tx_rate_str)).append(kReset);
+            }
+            frame_buffer_.append(kReset).append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
+        }
+
+        // Row 7: Upload Graph Bottom
+        {
+            frame_buffer_.append(kBorderColor).append("│").append(kReset);
+            frame_buffer_.append(kFgGray).append(fit_string(tx_scale_mid, 5)).append(" │").append(kReset);
+            append_block_graph_row(frame_buffer_, net.tx_history, graph_cols, 0, 2, tx_max, kFgOrange);
+            if (show_side_box) {
+                frame_buffer_.append(kReset).append(kBorderColor).append("│ ").append(kReset);
+                frame_buffer_.append(kFgGray).append(format_side_cell("Peak Rate:", tx_top_str)).append(kReset);
+            }
+            frame_buffer_.append(kReset).append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
+        }
+
+        // Row 8: Bottom Border
+        {
+            frame_buffer_.append(kBorderColor).append("└").append(kFgGray).append("   0B └");
+            for (std::size_t i = 0; i < graph_cols; ++i) frame_buffer_.append("─");
+            if (show_side_box) {
+                frame_buffer_.append(kBorderColor).append("┴");
+                for (std::size_t i = 0; i < kInfoWidth; ++i) frame_buffer_.append("─");
+            }
+            frame_buffer_.append(kBorderColor).append("┘").append(kReset).append(kClearLineEnd).append("\n");
+        }
     }
 
-    // Row 6: Upload Graph Top Row (row 1 of 2)
-    {
-        frame_buffer_.append(kBorderColor).append("│").append(kReset);
-        frame_buffer_.append(kFgGray).append(fit_string(tx_scale_top, 5)).append(" │").append(kReset);
-        append_block_graph_row(frame_buffer_, net.tx_history, graph_cols, 1, 2, tx_max, kFgOrange);
-        frame_buffer_.append(kReset).append(kBorderColor).append("│ ").append(kReset);
-
-        frame_buffer_.append(kFgOrange).append(format_side_cell("Current Rate:", tx_rate_str)).append(kReset);
-        frame_buffer_.append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
-    }
-
-    // Row 7: Upload Graph Bottom Row (row 0 of 2)
-    {
-        frame_buffer_.append(kBorderColor).append("│").append(kReset);
-        frame_buffer_.append(kFgGray).append(fit_string(tx_scale_mid, 5)).append(" │").append(kReset);
-        append_block_graph_row(frame_buffer_, net.tx_history, graph_cols, 0, 2, tx_max, kFgOrange);
-        frame_buffer_.append(kReset).append(kBorderColor).append("│ ").append(kReset);
-
-        frame_buffer_.append(kFgGray).append(format_side_cell("Peak Rate:", tx_top_str)).append(kReset);
-        frame_buffer_.append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
-    }
-
-    // Row 8: Baseline + Bottom Border: └─────┴─────┘
-    {
-        frame_buffer_.append(kBorderColor).append("└").append(kFgGray).append("   0B └");
-        for (std::size_t i = 0; i < graph_cols; ++i) frame_buffer_.append("─");
-        frame_buffer_.append(kBorderColor).append("┴");
-        for (std::size_t i = 0; i < kInfoWidth; ++i) frame_buffer_.append("─");
-        frame_buffer_.append("┘").append(kReset).append(kClearLineEnd).append("\n");
-    }
-
-    // 4. Pingtop Interactive Hotkeys Bar
+    // 4. Responsive Pingtop Interactive Hotkeys Bar
     frame_buffer_.append(kBgKeyBar).append(kBold)
                  .append(kFgCyan).append(" q ").append(kFgWhite).append("Quit ")
-                 .append(kFgCyan).append(" Enter ").append(kFgWhite).append("2D Graph ")
+                 .append(kFgCyan).append(" Enter ").append(kFgWhite).append("Graph ")
                  .append(kFgCyan).append(" t ").append(kFgWhite).append("MTR ")
                  .append(kFgCyan).append(" m ").append(kFgWhite).append("MTU ")
-                 .append(kFgCyan).append(" < / > ").append(kFgWhite).append("Iface ")
+                 .append(kFgCyan).append(" </> ").append(kFgWhite).append("Iface ")
                  .append(kFgCyan).append(" z ").append(kFgWhite).append("Zero ")
-                 .append(kFgCyan).append(" / ").append(kFgWhite).append("Search ")
-                 .append(kFgCyan).append(" g ").append(kFgWhite).append("Group ")
-                 .append(kFgCyan).append(" d ").append(kFgWhite).append("Scan ")
-                 .append(kFgCyan).append(" s ").append(kFgWhite).append("Sort ")
-                 .append(kFgCyan).append(" r ").append(kFgWhite).append("Reset ")
-                 .append(kFgCyan).append(" p ").append(kFgWhite).append("Pause ")
-                 .append(kFgCyan).append(" +/- ").append(kFgWhite).append("Int ")
-                 .append(kClearLineEnd).append(kReset);
+                 .append(kFgCyan).append(" / ").append(kFgWhite).append("Find ")
+                 .append(kFgCyan).append(" d ").append(kFgWhite).append("Scan ");
+    if (W >= 90) {
+        frame_buffer_.append(kFgCyan).append(" g ").append(kFgWhite).append("Group ")
+                     .append(kFgCyan).append(" s ").append(kFgWhite).append("Sort ")
+                     .append(kFgCyan).append(" r ").append(kFgWhite).append("Reset ")
+                     .append(kFgCyan).append(" p ").append(kFgWhite).append("Pause ");
+    }
+    frame_buffer_.append(kClearLineEnd).append(kReset);
 }
 
 } // namespace pingtop

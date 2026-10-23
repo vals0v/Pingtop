@@ -16,9 +16,12 @@ enum class ViewMode {
     Mtr     // Live hop-by-hop MTR / Traceroute view
 };
 
-// RAII ANSI/VT100 terminal renderer
+// RAII ANSI/VT100 terminal renderer with responsive layout
 class TuiRenderer {
 public:
+    static constexpr int kMinTermWidth  = 68;
+    static constexpr int kMinTermHeight = 16;
+
     TuiRenderer() noexcept;
     ~TuiRenderer() noexcept;
 
@@ -31,7 +34,6 @@ public:
     [[nodiscard]] static bool should_quit() noexcept;
     static void request_quit() noexcept;
 
-    // Navigation & View controls
     void move_selection(int delta, const NetworkMonitor& monitor) noexcept;
     [[nodiscard]] std::size_t selected_host_index(const NetworkMonitor& monitor) const;
 
@@ -41,7 +43,6 @@ public:
     void toggle_grouping() noexcept { group_by_category_ = !group_by_category_; }
     [[nodiscard]] bool group_by_category() const noexcept { return group_by_category_; }
 
-    // Live filter ('/' search mode)
     void start_search() noexcept { search_active_ = true; }
     void stop_search(bool clear_filter) noexcept;
     [[nodiscard]] bool is_search_active() const noexcept { return search_active_; }
@@ -52,10 +53,11 @@ public:
     void render(const NetworkMonitor& monitor);
 
 private:
-    void update_terminal_size() noexcept;
+    bool update_terminal_size() noexcept;
     [[nodiscard]] std::vector<std::size_t> build_visible_order(const NetworkMonitor& monitor) const;
     [[nodiscard]] bool matches_filter(const HostEntry& host) const noexcept;
 
+    void append_too_small_warning();
     void append_header(const NetworkMonitor& monitor);
     void append_table_view(const NetworkMonitor& monitor, const std::vector<std::size_t>& order);
     void append_detail_view(const NetworkMonitor& monitor, const std::vector<std::size_t>& order);
