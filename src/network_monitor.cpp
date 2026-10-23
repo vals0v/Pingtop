@@ -318,6 +318,7 @@ NetworkMonitor::~NetworkMonitor() {
 
 bool NetworkMonitor::initialize() {
     start_time_ = std::chrono::steady_clock::now();
+    sample_net_interfaces(start_time_);
     return socket_.open();
 }
 
@@ -1270,6 +1271,12 @@ void NetworkMonitor::poll_once(int poll_timeout_ms, const std::function<void(int
 
     check_timeouts(now);
 
+    const auto net_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_net_sample_time_);
+    const long long sample_thresh = (completed_rounds_ <= 1) ? 100 : 300;
+    if (last_net_sample_time_.time_since_epoch().count() == 0 || net_elapsed.count() >= sample_thresh) {
+        sample_net_interfaces(now);
+    }
+
     if (!paused_) {
         const bool first_run = (last_batch_send_time_.time_since_epoch().count() == 0);
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_batch_send_time_);
@@ -1380,6 +1387,10 @@ void NetworkMonitor::poll_once(int poll_timeout_ms, const std::function<void(int
                         on_key_pressed(kKeyArrowUp);
                     } else if (key_buf[2] == 'B') {
                         on_key_pressed(kKeyArrowDown);
+                    } else if (key_buf[2] == 'D') {
+                        on_key_pressed(kKeyArrowLeft);
+                    } else if (key_buf[2] == 'C') {
+                        on_key_pressed(kKeyArrowRight);
                     }
                 } else if (n == 1 && key_buf[0] == '\033') {
                     on_key_pressed(kKeyEscape);
@@ -1651,6 +1662,163 @@ std::string_view NetworkMonitor::sort_column_name() const noexcept {
         case SortColumn::PacketLoss: return "Packet Loss %";
     }
     return "Category / Default";
+}
+
+void NetworkMonitor::cycle_net_interface(int delta) noexcept {
+    if (net_interfaces_.empty()) {
+        active_net_idx_ = 0;
+        return;
+    }
+    const long long count = static_cast<long long>(net_interfaces_.size());
+    const long long cur = static_cast<long long>(std::min(active_net_idx_, net_interfaces_.size() - 1));
+    long long next = (cur + delta) % count;
+    if (next < 0) {
+        next += count;
+    }
+    active_net_idx_ = static_cast<std::size_t>(next);
+}
+
+void NetworkMonitor::reset_net_peaks() noexcept {
+    for (auto& iface : net_interfaces_) {
+        iface.rx_top_bps = iface.rx_speed_bps;
+        iface.tx_top_bps = iface.tx_speed_bps;
+        iface.rx_history.clear();
+        iface.tx_history.clear();
+    }
+}
+
+void NetworkMonitor::sample_net_interfaces(std::chrono::steady_clock::time_point now) {
+    const bool first_sample = (last_net_sample_time_.time_since_epoch().count() == 0);
+    const double dt_sec = first_sample
+        ? 0.0
+        : std::chrono::duration<double>(now - last_net_sample_time_).count();
+    last_net_sample_time_ = now;
+
+    struct RawCounter {
+        std::string   ipv4;
+        std::uint64_t rx{0};
+        std::uint64_t tx{0};
+    };
+    std::vector<std::pair<std::string, RawCounter>> counters;
+
+    auto find_or_add = [&](const std::string& name) -> RawCounter& {
+        for (auto& kv : counters) {
+            if (kv.first == name) {
+                return kv.second;
+            }
+        }
+        counters.push_back({name, RawCounter{}});
+        return counters.back().second;
+    };
+
+    ifaddrs* ifaddr = nullptr;
+    if (::getifaddrs(&ifaddr) == 0 && ifaddr != nullptr) {
+        for (const auto* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == nullptr || ifa->ifa_name == nullptr) {
+                continue;
+            }
+            if ((ifa->ifa_flags & IFF_UP) == 0 || (ifa->ifa_flags & IFF_LOOPBACK) != 0) {
+                continue;
+            }
+            const std::string name(ifa->ifa_name);
+            if (ifa->ifa_addr->sa_family == AF_INET) {
+                char ip_buf[INET_ADDRSTRLEN]{};
+                const auto* sin = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
+                if (::inet_ntop(AF_INET, &sin->sin_addr, ip_buf, sizeof(ip_buf)) != nullptr) {
+                    find_or_add(name).ipv4 = ip_buf;
+                }
+            }
+#if defined(__APPLE__)
+            else if (ifa->ifa_addr->sa_family == AF_LINK && ifa->ifa_data != nullptr) {
+                const auto* ifd = static_cast<const if_data*>(ifa->ifa_data);
+                auto& c = find_or_add(name);
+                c.rx = static_cast<std::uint64_t>(ifd->ifi_ibytes);
+                c.tx = static_cast<std::uint64_t>(ifd->ifi_obytes);
+            }
+#endif
+        }
+        ::freeifaddrs(ifaddr);
+    }
+
+#if defined(__linux__)
+    std::ifstream dev_file("/proc/net/dev");
+    if (dev_file.is_open()) {
+        std::string line;
+        std::getline(dev_file, line);
+        std::getline(dev_file, line);
+        while (std::getline(dev_file, line)) {
+            const auto colon = line.find(':');
+            if (colon == std::string::npos) {
+                continue;
+            }
+            const std::string name = trim_copy(std::string_view(line).substr(0, colon));
+            if (name == "lo") {
+                continue;
+            }
+            std::istringstream iss(line.substr(colon + 1));
+            std::uint64_t rx_bytes = 0, dummy = 0, tx_bytes = 0;
+            if (iss >> rx_bytes >> dummy >> dummy >> dummy >> dummy >> dummy >> dummy >> dummy >> tx_bytes) {
+                auto& c = find_or_add(name);
+                c.rx = rx_bytes;
+                c.tx = tx_bytes;
+            }
+        }
+    }
+#endif
+
+    const bool was_empty = net_interfaces_.empty();
+    for (const auto& [name, raw] : counters) {
+        // Keep interfaces that have an IPv4 address or non-zero traffic
+        if (raw.ipv4.empty() && raw.rx == 0 && raw.tx == 0) {
+            continue;
+        }
+
+        auto it = std::find_if(net_interfaces_.begin(), net_interfaces_.end(), [&](const NetInterfaceStats& s) {
+            return s.name == name;
+        });
+
+        if (it == net_interfaces_.end()) {
+            NetInterfaceStats entry{};
+            entry.name = name;
+            entry.ipv4 = raw.ipv4.empty() ? "no-ip" : raw.ipv4;
+            entry.rx_total = raw.rx;
+            entry.tx_total = raw.tx;
+            entry.rx_history.push(0.0);
+            entry.tx_history.push(0.0);
+            net_interfaces_.push_back(std::move(entry));
+        } else {
+            if (!raw.ipv4.empty()) {
+                it->ipv4 = raw.ipv4;
+            }
+            if (dt_sec > 0.05 && raw.rx >= it->rx_total && raw.tx >= it->tx_total) {
+                it->rx_speed_bps = static_cast<double>(raw.rx - it->rx_total) / dt_sec;
+                it->tx_speed_bps = static_cast<double>(raw.tx - it->tx_total) / dt_sec;
+                it->rx_top_bps = std::max(it->rx_top_bps, it->rx_speed_bps);
+                it->tx_top_bps = std::max(it->tx_top_bps, it->tx_speed_bps);
+                it->rx_history.push(it->rx_speed_bps);
+                it->tx_history.push(it->tx_speed_bps);
+            }
+            it->rx_total = raw.rx;
+            it->tx_total = raw.tx;
+        }
+    }
+
+    if (was_empty && !net_interfaces_.empty()) {
+        // Prefer en0 / eth0 / wlan0 or the first interface with a private LAN IPv4
+        for (std::size_t i = 0; i < net_interfaces_.size(); ++i) {
+            const auto& n = net_interfaces_[i];
+            if ((n.name == "en0" || n.name == "eth0" || n.name == "wlan0") && n.ipv4 != "no-ip") {
+                active_net_idx_ = i;
+                return;
+            }
+        }
+        for (std::size_t i = 0; i < net_interfaces_.size(); ++i) {
+            if (net_interfaces_[i].ipv4 != "no-ip") {
+                active_net_idx_ = i;
+                return;
+            }
+        }
+    }
 }
 
 } // namespace pingtop

@@ -199,8 +199,30 @@ int main(int argc, char* argv[]) {
                     break;
                 case 'b':
                 case 'B':
-                    monitor.stop_mtr();
-                    renderer.set_view_mode(pingtop::ViewMode::Table);
+                    if (renderer.view_mode() != pingtop::ViewMode::Table) {
+                        monitor.stop_mtr();
+                        renderer.set_view_mode(pingtop::ViewMode::Table);
+                    } else {
+                        monitor.cycle_net_interface(-1);
+                    }
+                    break;
+                case '[':
+                case ',':
+                case '<':
+                case pingtop::NetworkMonitor::kKeyArrowLeft:
+                    monitor.cycle_net_interface(-1);
+                    break;
+                case 'n':
+                case 'N':
+                case ']':
+                case '.':
+                case '>':
+                case pingtop::NetworkMonitor::kKeyArrowRight:
+                    monitor.cycle_net_interface(1);
+                    break;
+                case 'z':
+                case 'Z':
+                    monitor.reset_net_peaks();
                     break;
                 case '\n':
                 case '\r':
