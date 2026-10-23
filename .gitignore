@@ -1,0 +1,25 @@
+# Build directories
+build/
+cmake-build-*/
+bin/
+lib/
+
+# Compiled files
+pingtop
+*.o
+*.obj
+*.so
+*.dylib
+*.a
+*.exe
+*.out
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
