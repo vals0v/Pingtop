@@ -176,7 +176,8 @@ void NetworkMonitor::run_mtu_discovery(std::size_t host_idx) {
 bool NetworkMonitor::add_host(
     const std::string& target,
     const std::string& custom_label,
-    HostCategory category
+    HostCategory category,
+    bool is_dynamic
 ) {
     if (target.empty()) {
         return false;
@@ -315,6 +316,9 @@ bool NetworkMonitor::add_host(
             if (!custom_label.empty()) {
                 existing.display_name = custom_label;
             }
+            if (is_dynamic) {
+                existing.is_dynamic = true;
+            }
             return false;
         }
     }
@@ -327,6 +331,7 @@ bool NetworkMonitor::add_host(
         entry.path_mtu = 0;
     }
 
+    entry.is_dynamic = is_dynamic;
     hosts_.push_back(std::move(entry));
     return true;
 }
@@ -415,7 +420,7 @@ std::size_t NetworkMonitor::load_or_create_config_file(const std::string& custom
 
 void NetworkMonitor::discover_and_add_network_devices() {
     for (const auto& target : NetDiscovery::discover_all()) {
-        add_host(target.ip, target.label, target.category);
+        add_host(target.ip, target.label, target.category, true);
     }
 }
 
@@ -449,16 +454,50 @@ void NetworkMonitor::apply_pending_discoveries() {
         found.swap(pending_discovered_);
     }
 
+    // 1. Add or refresh newly discovered targets (tagged as dynamic)
     std::size_t added = 0;
     for (const auto& t : found) {
-        if (add_host(t.ip, t.label, t.category)) {
+        if (add_host(t.ip, t.label, t.category, true)) {
             ++added;
         }
     }
 
-    status_msg_ = (added > 0)
-        ? ("Scan done: +" + std::to_string(added) + " new host(s)")
-        : "Scan done: all LAN/VPN hosts up to date";
+    // 2. Smart cleanup: remove dynamic VPN tunnel interfaces that are no longer in found
+    std::size_t removed = 0;
+    for (std::size_t i = 0; i < hosts_.size(); ) {
+        auto& h = hosts_[i];
+        if (h.is_dynamic && h.category == HostCategory::Vpn) {
+            const bool still_present = std::any_of(found.begin(), found.end(), [&](const DiscoveredTarget& dt) {
+                return dt.ip == h.hostname || dt.ip == h.resolved_ip ||
+                       (dt.ip + ":" + std::to_string(h.tcp_port)) == h.hostname;
+            });
+
+            if (!still_present) {
+                if (h.tcp_fd >= 0) {
+                    ::close(h.tcp_fd);
+                    h.tcp_fd = -1;
+                }
+                if (mtr_active_ && (mtr_target_ip_ == h.hostname || mtr_target_ip_ == h.resolved_ip)) {
+                    stop_mtr();
+                }
+                hosts_.erase(hosts_.begin() + static_cast<std::ptrdiff_t>(i));
+                ++removed;
+                continue;
+            }
+        }
+        ++i;
+    }
+
+    // 3. Status notification
+    if (added > 0 && removed > 0) {
+        status_msg_ = "Scan: +" + std::to_string(added) + " new, -" + std::to_string(removed) + " closed VPN";
+    } else if (added > 0) {
+        status_msg_ = "Scan done: +" + std::to_string(added) + " new host(s)";
+    } else if (removed > 0) {
+        status_msg_ = "Scan done: -" + std::to_string(removed) + " inactive VPN(s) removed";
+    } else {
+        status_msg_ = "Scan done: all LAN/VPN hosts up to date";
+    }
     status_expiry_ = std::chrono::steady_clock::now() + std::chrono::seconds(4);
 }
 

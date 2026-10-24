@@ -63,6 +63,7 @@ struct HostEntry {
     HostCategory  category{HostCategory::Internet};
     std::string   asn_info;
     std::uint16_t path_mtu{1500};
+    bool          is_dynamic{false};
 
     std::uint64_t sent_count{0};
     std::uint64_t completed_count{0};
@@ -125,7 +126,8 @@ public:
     bool add_host(
         const std::string& target,
         const std::string& custom_label = "",
-        HostCategory category = HostCategory::Internet
+        HostCategory category = HostCategory::Internet,
+        bool is_dynamic = false
     );
 
     void add_default_hosts();
