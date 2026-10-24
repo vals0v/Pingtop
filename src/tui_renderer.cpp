@@ -617,8 +617,10 @@ void TuiRenderer::append_header(const NetworkMonitor& monitor) {
         mode_badge = "[MTR]";
     }
 
+    const std::string status_msg = monitor.status_message();
+
     frame_buffer_.append(kBgTitle).append(kBold).append(kFgWhite);
-    if (term_width_ >= 92) {
+    if (term_width_ >= 96 && status_msg.empty()) {
         frame_buffer_.append(" ⚡ PINGTOP v1.3 — Network Latency, MTR & Quality Monitor ");
     } else {
         frame_buffer_.append(" ⚡ PINGTOP v1.3 ");
@@ -630,7 +632,6 @@ void TuiRenderer::append_header(const NetworkMonitor& monitor) {
     if (monitor.is_paused()) {
         frame_buffer_.append(kFgYellow).append(kBold).append(" [PAUSED] ");
     }
-    const std::string status_msg = monitor.status_message();
     if (!status_msg.empty()) {
         frame_buffer_.append(kFgYellow).append(kBold).append(" [").append(status_msg).append("] ");
     }
@@ -1211,8 +1212,12 @@ void TuiRenderer::append_footer(const NetworkMonitor& monitor, const std::vector
                  .append(kFgCyan).append(" m ").append(kFgWhite).append("MTU ")
                  .append(kFgCyan).append(" </> ").append(kFgWhite).append("Iface ")
                  .append(kFgCyan).append(" z ").append(kFgWhite).append("Zero ")
-                 .append(kFgCyan).append(" / ").append(kFgWhite).append("Find ")
-                 .append(kFgCyan).append(" d ").append(kFgWhite).append("Scan ");
+                 .append(kFgCyan).append(" / ").append(kFgWhite).append("Find ");
+    if (monitor.is_scanning()) {
+        frame_buffer_.append(kBold).append("\033[93m").append(" d ").append(kFgWhite).append("Scanning... ").append(kReset).append(kBgKeyBar);
+    } else {
+        frame_buffer_.append(kFgCyan).append(" d ").append(kFgWhite).append("Scan ");
+    }
     if (W >= 90) {
         frame_buffer_.append(kFgCyan).append(" g ").append(kFgWhite).append("Group ")
                      .append(kFgCyan).append(" s ").append(kFgWhite).append("Sort ")

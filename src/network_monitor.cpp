@@ -609,6 +609,175 @@ void NetworkMonitor::read_mtr_pipe() {
     }
 }
 
+[[nodiscard]] static int normalize_input_key(const char* buf, ssize_t len) noexcept {
+    if (len <= 0) {
+        return 0;
+    }
+    if (len == 1) {
+        return static_cast<unsigned char>(buf[0]);
+    }
+
+    const auto b0 = static_cast<std::uint8_t>(buf[0]);
+    const auto b1 = static_cast<std::uint8_t>(buf[1]);
+    std::uint32_t cp = 0;
+
+    if ((b0 & 0xE0U) == 0xC0U && len >= 2) {
+        cp = ((static_cast<std::uint32_t>(b0) & 0x1FU) << 6U) |
+             (static_cast<std::uint32_t>(b1) & 0x3FU);
+    } else if ((b0 & 0xF0U) == 0xE0U && len >= 3) {
+        const auto b2 = static_cast<std::uint8_t>(buf[2]);
+        cp = ((static_cast<std::uint32_t>(b0) & 0x0FU) << 12U) |
+             ((static_cast<std::uint32_t>(b1) & 0x3FU) << 6U)  |
+             (static_cast<std::uint32_t>(b2) & 0x3FU);
+    } else {
+        return static_cast<unsigned char>(buf[0]);
+    }
+
+    switch (cp) {
+        // --- 'd' (Scan) ---
+        case 0x0432: case 0x0412: // Cyrillic 'в' / 'В' (physical D)
+        case 0x0434: case 0x0414: // Cyrillic 'д' / 'Д' (phonetic D)
+        case 0x03B4: case 0x0394: // Greek 'δ' / 'Δ' (Delta)
+        case 0x03B3: case 0x0393: // Greek 'γ' / 'Γ' (physical D)
+        case 0x05D2: case 0x05D3: // Hebrew 'ג' (physical D) / 'ד' (Dalet)
+        case 0x064A: case 0x062F: // Arabic 'ي' (physical D) / 'د' (Dal)
+        case 0x10D3:             // Georgian 'დ' (D)
+        case 0x0564: case 0x057F: // Armenian 'դ' / 'տ' (physical D)
+            return 'd';
+
+        // --- 'q' (Quit) ---
+        case 0x0439: case 0x0419: // Cyrillic 'й' / 'Й' (physical Q)
+        case 0x05E7:             // Hebrew 'ק' (Qof)
+        case 0x0636:             // Arabic 'ض' (physical Q)
+        case 0x10E5:             // Georgian 'ქ' (physical Q)
+        case 0x0584:             // Armenian 'ք' (physical Q)
+            return 'q';
+
+        // --- 't' (MTR) ---
+        case 0x0435: case 0x0415: // Cyrillic 'е' / 'Е' (physical T)
+        case 0x03C4: case 0x03A4: // Greek 'τ' / 'Τ' (Tau)
+        case 0x05D0: case 0x05D8: case 0x05EA: // Hebrew 'א' / 'ט' / 'ת'
+        case 0x0641:             // Arabic 'ف' (physical T)
+        case 0x10D7: case 0x10E2: // Georgian 'თ' / 'ტ'
+        case 0x0569:             // Armenian 'թ'
+            return 't';
+
+        // --- 'm' (MTU) ---
+        case 0x044C: case 0x042C: // Cyrillic 'ь' / 'Ь' (physical M)
+        case 0x03BC: case 0x039C: // Greek 'μ' / 'Μ' (Mu)
+        case 0x05E6: case 0x05DE: case 0x05DD: // Hebrew 'צ' / 'מ' / 'ם'
+        case 0x0629: case 0x0645: // Arabic 'ة' / 'م'
+        case 0x10DB:             // Georgian 'მ' (physical M)
+        case 0x0574:             // Armenian 'մ' (physical M)
+            return 'm';
+
+        // --- 'g' (Group) ---
+        case 0x043F: case 0x041F: // Cyrillic 'п' / 'П' (physical G)
+        case 0x0433: case 0x0413: // Cyrillic 'г' / 'Г' (phonetic G)
+        case 0x05E2:             // Hebrew 'ע' (physical G)
+        case 0x0644: case 0x063A: // Arabic 'ل' / 'غ'
+        case 0x10D2:             // Georgian 'გ' (physical G)
+        case 0x0563:             // Armenian 'գ' (physical G)
+            return 'g';
+
+        // --- 's' (Sort) ---
+        case 0x044B: case 0x042B: // Cyrillic 'ы' / 'Ы' (physical S)
+        case 0x0456: case 0x0406: // Ukrainian 'і' / 'І' (physical S)
+        case 0x0441: case 0x0421: // Cyrillic 'с' / 'С' (phonetic S)
+        case 0x03C3: case 0x03A3: case 0x03C2: // Greek 'σ' / 'Σ' / 'ς' (Sigma)
+        case 0x05E1: case 0x05E9: // Hebrew 'ס' / 'ש'
+        case 0x0633: case 0x0635: // Arabic 'س' / 'ص'
+        case 0x10E1:             // Georgian 'ს' (physical S)
+        case 0x057D:             // Armenian 'ս' (physical S)
+            return 's';
+
+        // --- 'p' (Pause) ---
+        case 0x0437: case 0x0417: // Cyrillic 'з' / 'З' (physical P)
+        case 0x03C0: case 0x03A0: // Greek 'π' / 'Π' (Pi)
+        case 0x05E4: case 0x05E3: // Hebrew 'פ' / 'ף' (Pe)
+        case 0x062D:             // Arabic 'ح' (physical P)
+        case 0x10DE: case 0x10E4: // Georgian 'პ' / 'ფ'
+        case 0x057A: case 0x0583: // Armenian 'պ' / 'փ'
+            return 'p';
+
+        // --- 'r' (Reset) ---
+        case 0x043A: case 0x041A: // Cyrillic 'к' / 'К' (physical R)
+        case 0x0440: case 0x0420: // Cyrillic 'р' / 'Р' (phonetic R)
+        case 0x03C1: case 0x03A1: // Greek 'ρ' / 'Ρ' (Rho)
+        case 0x05E8:             // Hebrew 'ר' (Resh)
+        case 0x0642: case 0x0631: // Arabic 'ق' / 'ر'
+        case 0x10E0:             // Georgian 'რ' (physical R)
+        case 0x0580: case 0x057C: // Armenian 'ր' / 'ռ'
+            return 'r';
+
+        // --- 'z' (Zero peaks) ---
+        case 0x044F: case 0x042F: // Cyrillic 'я' / 'Я' (physical Z)
+        case 0x03B6: case 0x0396: // Greek 'ζ' / 'Ζ' (Zeta)
+        case 0x05D6:             // Hebrew 'ז' (Zayin)
+        case 0x0626: case 0x0632: // Arabic 'ئ' / 'ز'
+        case 0x10D6:             // Georgian 'ზ' (physical Z)
+        case 0x0566:             // Armenian 'զ' (physical Z)
+            return 'z';
+
+        // --- 'v' (Detail graph) ---
+        case 0x043C: case 0x041C: // Cyrillic 'м' / 'М' (physical V)
+        case 0x03C9: case 0x03A9: // Greek 'ω' / 'Ω' (Omega)
+        case 0x05D4: case 0x05D5: // Hebrew 'ה' / 'ו'
+        case 0x0648:             // Arabic 'و'
+        case 0x10D5:             // Georgian 'ვ' (physical V)
+        case 0x057E:             // Armenian 'վ' (physical V)
+            return 'v';
+
+        // --- 'b' (Back / Iface prev) ---
+        case 0x0438: case 0x0418: // Cyrillic 'и' / 'И' (physical B)
+        case 0x0431: case 0x0411: // Cyrillic 'б' / 'Б' (phonetic B)
+        case 0x03B2: case 0x0392: // Greek 'β' / 'Β' (Beta)
+        case 0x05E0: case 0x05D1: // Hebrew 'נ' / 'ב'
+        case 0xFEFB: case 0x0628: // Arabic 'لا' / 'ب'
+        case 0x10D1:             // Georgian 'ბ' (physical B)
+        case 0x0562:             // Armenian 'բ' (physical B)
+            return 'b';
+
+        // --- 'n' (Iface next) ---
+        case 0x0442: case 0x0422: // Cyrillic 'т' / 'Т' (physical N)
+        case 0x043D: case 0x041D: // Cyrillic 'н' / 'Н' (phonetic N)
+        case 0x03BD: case 0x039D: // Greek 'ν' / 'Ν' (Nu)
+        case 0x0649:             // Arabic 'ى' (physical N)
+        case 0x10DC:             // Georgian 'ნ' (physical N)
+        case 0x0576:             // Armenian 'ն' (physical N)
+            return 'n';
+
+        // --- 'j' (Down) & 'k' (Up) ---
+        case 0x043E: case 0x041E: // Cyrillic 'о' / 'О' (physical J)
+        case 0x03BE: case 0x039E: // Greek 'ξ' / 'Ξ'
+        case 0x05D7:             // Hebrew 'ח' (physical J)
+        case 0x062A:             // Arabic 'ت' (physical J)
+        case 0x10EF:             // Georgian 'ჯ'
+        case 0x0575:             // Armenian 'յ'
+            return 'j';
+
+        case 0x043B: case 0x041B: // Cyrillic 'л' / 'Л' (physical K)
+        case 0x03BA: case 0x039A: // Greek 'κ' / 'Κ' (Kappa)
+        case 0x05DC:             // Hebrew 'ל' (Lamed)
+        case 0x0646:             // Arabic 'ن' (physical K)
+        case 0x10D9:             // Georgian 'კ'
+        case 0x056F:             // Armenian 'կ'
+            return 'k';
+
+        // --- '[' & ']' (Iface cycle) ---
+        case 0x0445: case 0x0425: // Cyrillic 'х' / 'Х' (physical [)
+        case 0x062C:             // Arabic 'ج' (physical [)
+            return '[';
+
+        case 0x044A: case 0x042A: // Cyrillic 'ъ' / 'Ъ' (physical ])
+        case 0x0457: case 0x0407: // Ukrainian 'ї' / 'Ї' (physical ])
+            return ']';
+
+        default:
+            return static_cast<int>(cp);
+    }
+}
+
 void NetworkMonitor::poll_once(int poll_timeout_ms, const std::function<void(int)>& on_key_pressed) {
     const auto now = std::chrono::steady_clock::now();
 
@@ -741,7 +910,7 @@ void NetworkMonitor::poll_once(int poll_timeout_ms, const std::function<void(int
                 } else if (key_buf[0] == 127 || key_buf[0] == 8) {
                     on_key_pressed(kKeyBackspace);
                 } else {
-                    on_key_pressed(static_cast<unsigned char>(key_buf[0]));
+                    on_key_pressed(normalize_input_key(key_buf, n));
                 }
             }
         }
