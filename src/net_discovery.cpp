@@ -491,17 +491,29 @@ std::vector<DiscoveredTarget> NetDiscovery::discover_lan_devices() {
     return targets;
 }
 
+[[nodiscard]] static bool is_vpn_iface(std::string_view name) noexcept {
+    return name.starts_with("utun") ||
+           name.starts_with("tun")  ||
+           name.starts_with("tap")  ||
+           name.starts_with("wg")   ||
+           name.starts_with("tailscale") ||
+           name.starts_with("zt")   ||
+           name.starts_with("ppp")  ||
+           name.starts_with("nebula") ||
+           name.starts_with("wireguard");
+}
+
 std::vector<DiscoveredTarget> NetDiscovery::discover_vpn_and_tailscale() {
     std::vector<DiscoveredTarget> targets;
     const auto local_ips = get_local_ips();
     auto host_map = build_fast_host_map();
     bool tailscale_detected = false;
 
-    // 1. Check interfaces for Tailscale CGNAT (100.64.0.0/10) and point-to-point VPNs
+    // 1. Check interfaces for Tailscale CGNAT (100.64.0.0/10), point-to-point VPNs, and VPN tun/tap IPs
     ifaddrs* ifaddr = nullptr;
     if (::getifaddrs(&ifaddr) == 0 && ifaddr != nullptr) {
         for (const auto* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-            if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET) {
+            if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET || ifa->ifa_name == nullptr) {
                 continue;
             }
             char local_buf[INET_ADDRSTRLEN]{};
@@ -528,9 +540,127 @@ std::vector<DiscoveredTarget> NetDiscovery::discover_vpn_and_tailscale() {
         ::freeifaddrs(ifaddr);
     }
 
-    // 2. Query Tailscale CLI if Tailscale interface is active (non-hanging check)
-    if (tailscale_detected) {
-        const std::array<const char*, 3> tailscale_bins = {
+    // 2. Universal Kernel Routing Table Discovery for ANY VPN (WireGuard, OpenVPN, custom tun/tap, Nebula, ZeroTier)
+#if defined(__APPLE__)
+    {
+        FILE* rpipe = ::popen("/usr/sbin/netstat -rn -f inet 2>/dev/null", "r");
+        if (rpipe != nullptr) {
+            char rline[512]{};
+            while (std::fgets(rline, sizeof(rline), rpipe) != nullptr) {
+                std::istringstream iss(rline);
+                std::string dest, gw, flags, netif;
+                if (iss >> dest >> gw >> flags >> netif) {
+                    if (is_vpn_iface(netif) && dest != "default") {
+                        const auto slash = dest.find('/');
+                        const std::string ip = (slash != std::string::npos) ? dest.substr(0, slash) : dest;
+                        in_addr test_addr{};
+                        if (::inet_pton(AF_INET, ip.c_str(), &test_addr) == 1) {
+                            if (!ip.starts_with("127.") && !ip.starts_with("224.") &&
+                                !ip.starts_with("239.") && !ip.starts_with("255.") &&
+                                !ip.ends_with(".255") &&
+                                std::find(local_ips.begin(), local_ips.end(), ip) == local_ips.end()) {
+                                const auto it = host_map.find(ip);
+                                std::string label = (it != host_map.end())
+                                    ? ("VPN (" + netif + "): " + it->second)
+                                    : (is_tailscale_ip(ip) ? ("Tailscale: " + ip) : ("VPN (" + netif + "): " + ip));
+                                targets.push_back({ip, std::move(label), HostCategory::Vpn});
+                            }
+                        }
+                    }
+                }
+            }
+            ::pclose(rpipe);
+        }
+    }
+#elif defined(__linux__)
+    {
+        std::ifstream route_file("/proc/net/route");
+        if (route_file.is_open()) {
+            std::string rline;
+            if (std::getline(route_file, rline)) {
+                while (std::getline(route_file, rline)) {
+                    std::istringstream iss(rline);
+                    std::string iface, dest_hex, gw_hex, flags_hex;
+                    if (iss >> iface >> dest_hex >> gw_hex >> flags_hex) {
+                        if (is_vpn_iface(iface)) {
+                            const unsigned long dest_val = std::strtoul(dest_hex.c_str(), nullptr, 16);
+                            const unsigned long gw_val = std::strtoul(gw_hex.c_str(), nullptr, 16);
+                            for (unsigned long val : {dest_val, gw_val}) {
+                                if (val != 0) {
+                                    in_addr addr{};
+                                    addr.s_addr = static_cast<in_addr_t>(val);
+                                    char ip_buf[INET_ADDRSTRLEN]{};
+                                    if (::inet_ntop(AF_INET, &addr, ip_buf, sizeof(ip_buf)) != nullptr) {
+                                        const std::string ip(ip_buf);
+                                        if (!ip.starts_with("127.") && !ip.starts_with("224.") &&
+                                            !ip.starts_with("239.") && !ip.ends_with(".255") &&
+                                            std::find(local_ips.begin(), local_ips.end(), ip) == local_ips.end()) {
+                                            const auto it = host_map.find(ip);
+                                            std::string label = (it != host_map.end())
+                                                ? ("VPN (" + iface + "): " + it->second)
+                                                : (is_tailscale_ip(ip) ? ("Tailscale: " + ip) : ("VPN (" + iface + "): " + ip));
+                                            targets.push_back({ip, std::move(label), HostCategory::Vpn});
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    // 3. WireGuard CLI discovery (wg show all dump)
+    {
+        const std::array<const char*, 3> wg_bins = {
+            "/usr/bin/wg",
+            "/usr/local/bin/wg",
+            "/opt/homebrew/bin/wg"
+        };
+        for (const auto* bin : wg_bins) {
+            if (::access(bin, X_OK) != 0) {
+                continue;
+            }
+            std::string cmd = std::string(bin) + " show all dump 2>/dev/null";
+            FILE* pipe = ::popen(cmd.c_str(), "r");
+            if (pipe != nullptr) {
+                char line[1024]{};
+                while (std::fgets(line, sizeof(line), pipe) != nullptr) {
+                    std::istringstream iss(line);
+                    std::string iface, pubkey, psk, endpoint, allowed_ips;
+                    if (iss >> iface >> pubkey >> psk >> endpoint >> allowed_ips) {
+                        std::istringstream aiss(allowed_ips);
+                        std::string item;
+                        while (std::getline(aiss, item, ',')) {
+                            const auto slash = item.find('/');
+                            const std::string ip = (slash != std::string::npos) ? item.substr(0, slash) : item;
+                            in_addr test_addr{};
+                            if (::inet_pton(AF_INET, ip.c_str(), &test_addr) == 1) {
+                                if (!ip.starts_with("127.") && !ip.starts_with("0.") &&
+                                    std::find(local_ips.begin(), local_ips.end(), ip) == local_ips.end()) {
+                                    const auto it = host_map.find(ip);
+                                    const std::string label = (it != host_map.end())
+                                        ? ("WG: " + it->second)
+                                        : ("WG (" + iface + "): " + ip);
+                                    targets.push_back({ip, label, HostCategory::Vpn});
+                                }
+                            }
+                        }
+                    }
+                }
+                ::pclose(pipe);
+                break;
+            }
+        }
+    }
+
+    // 4. Query Tailscale / Headscale CLI if Tailscale is detected or present
+    {
+        const std::array<const char*, 5> tailscale_bins = {
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+            "/Applications/Tailscale.app/Contents/Resources/tailscale",
             "/opt/homebrew/bin/tailscale",
             "/usr/local/bin/tailscale",
             "/usr/bin/tailscale"
@@ -539,7 +669,7 @@ std::vector<DiscoveredTarget> NetDiscovery::discover_vpn_and_tailscale() {
             if (::access(bin, X_OK) != 0) {
                 continue;
             }
-            std::string cmd = std::string(bin) + " status 2>/dev/null";
+            std::string cmd = "\"" + std::string(bin) + "\" status 2>/dev/null";
             FILE* pipe = ::popen(cmd.c_str(), "r");
             if (pipe != nullptr) {
                 char line[512]{};
@@ -549,6 +679,7 @@ std::vector<DiscoveredTarget> NetDiscovery::discover_vpn_and_tailscale() {
                     if (iss >> ip >> name) {
                         if (is_tailscale_ip(ip) &&
                             std::find(local_ips.begin(), local_ips.end(), ip) == local_ips.end()) {
+                            tailscale_detected = true;
                             host_map[ip] = name;
                             targets.push_back({ip, "TS: " + name, HostCategory::Vpn});
                         }
@@ -560,7 +691,41 @@ std::vector<DiscoveredTarget> NetDiscovery::discover_vpn_and_tailscale() {
         }
     }
 
-    // 3. Discover active SSH sessions (port 22) and Tailscale peers
+    // 5. ZeroTier CLI discovery (zerotier-cli listpeers)
+    {
+        const std::array<const char*, 4> zt_bins = {
+            "/usr/sbin/zerotier-cli",
+            "/usr/bin/zerotier-cli",
+            "/usr/local/bin/zerotier-cli",
+            "/opt/homebrew/bin/zerotier-cli"
+        };
+        for (const auto* bin : zt_bins) {
+            if (::access(bin, X_OK) != 0) {
+                continue;
+            }
+            std::string cmd = std::string(bin) + " listpeers 2>/dev/null";
+            FILE* pipe = ::popen(cmd.c_str(), "r");
+            if (pipe != nullptr) {
+                char line[512]{};
+                while (std::fgets(line, sizeof(line), pipe) != nullptr) {
+                    std::istringstream iss(line);
+                    std::string ztaddr, ver, role, lat, link, tx, rx, path;
+                    if (iss >> ztaddr >> ver >> role >> lat >> link >> tx >> rx >> path) {
+                        const auto slash = path.find('/');
+                        const std::string ip = (slash != std::string::npos) ? path.substr(0, slash) : path;
+                        in_addr test_addr{};
+                        if (::inet_pton(AF_INET, ip.c_str(), &test_addr) == 1 && !ip.starts_with("127.")) {
+                            targets.push_back({ip, "ZeroTier: " + ztaddr, HostCategory::Vpn});
+                        }
+                    }
+                }
+                ::pclose(pipe);
+                break;
+            }
+        }
+    }
+
+    // 6. Discover active SSH sessions (port 22) and VPN peers via socket inspection
 #if defined(__APPLE__)
     {
         FILE* pipe = ::popen("/usr/sbin/lsof -iTCP -sTCP:ESTABLISHED -n -P 2>/dev/null", "r");
@@ -686,7 +851,25 @@ std::vector<DiscoveredTarget> NetDiscovery::discover_vpn_and_tailscale() {
         targets.push_back({"100.100.100.100", "Tailscale MagicDNS", HostCategory::Vpn});
     }
 
-    return targets;
+    // Deduplicate by target IP while preserving the most specific human-readable label
+    std::vector<DiscoveredTarget> unique_targets;
+    std::unordered_map<std::string, std::size_t> ip_to_idx;
+
+    for (auto& t : targets) {
+        if (const auto it = ip_to_idx.find(t.ip); it != ip_to_idx.end()) {
+            auto& existing = unique_targets[it->second];
+            if ((t.label.starts_with("TS: ") || t.label.starts_with("WG: ") ||
+                 t.label.starts_with("SSH [") || t.label.starts_with("ZeroTier: ")) &&
+                (existing.label.starts_with("VPN (") || existing.label.starts_with("Tailscale: "))) {
+                existing.label = std::move(t.label);
+            }
+        } else {
+            ip_to_idx[t.ip] = unique_targets.size();
+            unique_targets.push_back(std::move(t));
+        }
+    }
+
+    return unique_targets;
 }
 
 std::vector<DiscoveredTarget> NetDiscovery::discover_all() {
