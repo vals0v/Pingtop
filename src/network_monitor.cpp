@@ -138,6 +138,10 @@ NetworkMonitor::~NetworkMonitor() {
         scan_thread_.join();
     }
     stop_mtr();
+    if (exporter_fd_ >= 0) {
+        ::close(exporter_fd_);
+        exporter_fd_ = -1;
+    }
     for (HostEntry& h : hosts_) {
         close_tcp_probe(h);
     }
@@ -146,7 +150,33 @@ NetworkMonitor::~NetworkMonitor() {
 bool NetworkMonitor::initialize() {
     start_time_ = std::chrono::steady_clock::now();
     NetDiscovery::sample_net_interfaces(net_interfaces_, last_net_sample_time_, start_time_);
-    return socket_.open();
+    if (!socket_.open()) {
+        return false;
+    }
+
+    if (config_.exporter_port > 0) {
+        const int srv = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (srv >= 0) {
+            const int reuse = 1;
+            (void)::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+            const int flags = ::fcntl(srv, F_GETFL, 0);
+            if (flags >= 0) {
+                (void)::fcntl(srv, F_SETFL, flags | O_NONBLOCK);
+            }
+            sockaddr_in bind_addr{};
+            bind_addr.sin_family = AF_INET;
+            bind_addr.sin_addr.s_addr = INADDR_ANY;
+            bind_addr.sin_port = host_to_net16(config_.exporter_port);
+            if (::bind(srv, reinterpret_cast<const sockaddr*>(&bind_addr), sizeof(bind_addr)) == 0 &&
+                ::listen(srv, 16) == 0) {
+                exporter_fd_ = srv;
+            } else {
+                ::close(srv);
+            }
+        }
+    }
+
+    return true;
 }
 
 void NetworkMonitor::close_tcp_probe(HostEntry& host) noexcept {
@@ -840,7 +870,7 @@ void NetworkMonitor::poll_once(int poll_timeout_ms, const std::function<void(int
     }
 
     std::vector<pollfd> fds;
-    fds.reserve(5 + hosts_.size());
+    fds.reserve(6 + hosts_.size());
 
     int icmp_slot = -1;
     if (socket_.is_open()) {
@@ -854,13 +884,22 @@ void NetworkMonitor::poll_once(int poll_timeout_ms, const std::function<void(int
         fds.push_back(pollfd{socket_.fd6(), POLLIN, 0});
     }
 
-    const int stdin_slot = static_cast<int>(fds.size());
-    fds.push_back(pollfd{STDIN_FILENO, POLLIN, 0});
+    int stdin_slot = -1;
+    if (on_key_pressed) {
+        stdin_slot = static_cast<int>(fds.size());
+        fds.push_back(pollfd{STDIN_FILENO, POLLIN, 0});
+    }
 
     int mtr_slot = -1;
     if (mtr_pipe_fd_ >= 0) {
         mtr_slot = static_cast<int>(fds.size());
         fds.push_back(pollfd{mtr_pipe_fd_, POLLIN, 0});
+    }
+
+    int exporter_slot = -1;
+    if (exporter_fd_ >= 0) {
+        exporter_slot = static_cast<int>(fds.size());
+        fds.push_back(pollfd{exporter_fd_, POLLIN, 0});
     }
 
     struct ProbeSlot {
@@ -887,6 +926,10 @@ void NetworkMonitor::poll_once(int poll_timeout_ms, const std::function<void(int
 
         if (mtr_slot >= 0 && (fds[static_cast<std::size_t>(mtr_slot)].revents & (POLLIN | POLLHUP)) != 0) {
             read_mtr_pipe();
+        }
+
+        if (exporter_slot >= 0 && (fds[static_cast<std::size_t>(exporter_slot)].revents & POLLIN) != 0) {
+            serve_exporter_request();
         }
 
         for (const auto& ps : probe_slots) {
@@ -930,7 +973,7 @@ void NetworkMonitor::poll_once(int poll_timeout_ms, const std::function<void(int
             }
         }
 
-        if ((fds[static_cast<std::size_t>(stdin_slot)].revents & POLLIN) != 0) {
+        if (stdin_slot >= 0 && (fds[static_cast<std::size_t>(stdin_slot)].revents & POLLIN) != 0) {
             char key_buf[8]{};
             const ssize_t n = ::read(STDIN_FILENO, key_buf, sizeof(key_buf));
             if (n > 0 && on_key_pressed) {
@@ -1236,6 +1279,272 @@ void NetworkMonitor::reset_net_peaks() noexcept {
         iface.tx_top_bps = iface.tx_speed_bps;
         iface.rx_history.clear();
         iface.tx_history.clear();
+    }
+}
+
+[[nodiscard]] static std::string escape_label_str(std::string_view sv) {
+    std::string out;
+    out.reserve(sv.size() + 4);
+    for (char c : sv) {
+        if (c == '"' || c == '\\') {
+            out.push_back('\\');
+            out.push_back(c);
+        } else if (c == '\n' || c == '\r') {
+            out.push_back(' ');
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] static const char* category_label(HostCategory cat) noexcept {
+    switch (cat) {
+        case HostCategory::LocalLan: return "lan";
+        case HostCategory::Vpn:      return "vpn";
+        case HostCategory::Internet:
+        default:                     return "wan";
+    }
+}
+
+[[nodiscard]] static std::string proto_label(const HostEntry& h) {
+    if (h.probe_type == ProbeType::Dns) {
+        return "dns:53";
+    }
+    if (h.probe_type == ProbeType::Tcp) {
+        return "tcp:" + std::to_string(h.tcp_port);
+    }
+    return h.is_ipv6 ? "icmpv6" : "icmp";
+}
+
+std::string NetworkMonitor::format_prometheus_metrics() const {
+    std::ostringstream oss;
+    oss << "# HELP pingtop_host_up Target reachability status (1 = online, 0 = offline)\n"
+        << "# TYPE pingtop_host_up gauge\n"
+        << "# HELP pingtop_rtt_ms Latest Round-Trip Time in milliseconds\n"
+        << "# TYPE pingtop_rtt_ms gauge\n"
+        << "# HELP pingtop_rtt_min_ms Minimum Round-Trip Time in milliseconds\n"
+        << "# TYPE pingtop_rtt_min_ms gauge\n"
+        << "# HELP pingtop_rtt_avg_ms Mean Round-Trip Time in milliseconds\n"
+        << "# TYPE pingtop_rtt_avg_ms gauge\n"
+        << "# HELP pingtop_rtt_max_ms Maximum Round-Trip Time in milliseconds\n"
+        << "# TYPE pingtop_rtt_max_ms gauge\n"
+        << "# HELP pingtop_rtt_p50_ms 50th percentile (median) RTT in milliseconds\n"
+        << "# TYPE pingtop_rtt_p50_ms gauge\n"
+        << "# HELP pingtop_rtt_p95_ms 95th percentile RTT in milliseconds\n"
+        << "# TYPE pingtop_rtt_p95_ms gauge\n"
+        << "# HELP pingtop_rtt_p99_ms 99th percentile tail latency in milliseconds\n"
+        << "# TYPE pingtop_rtt_p99_ms gauge\n"
+        << "# HELP pingtop_jitter_ms RFC 3550 smoothed inter-packet jitter in milliseconds\n"
+        << "# TYPE pingtop_jitter_ms gauge\n"
+        << "# HELP pingtop_loss_percent Packet loss percentage (0..100)\n"
+        << "# TYPE pingtop_loss_percent gauge\n"
+        << "# HELP pingtop_path_mtu_bytes Discovered unfragmented Path MTU in bytes\n"
+        << "# TYPE pingtop_path_mtu_bytes gauge\n"
+        << "# HELP pingtop_packets_sent_total Total probes transmitted to target\n"
+        << "# TYPE pingtop_packets_sent_total counter\n"
+        << "# HELP pingtop_packets_lost_total Total probes timed out for target\n"
+        << "# TYPE pingtop_packets_lost_total counter\n";
+
+    for (const auto& h : hosts_) {
+        const auto pct = h.compute_percentiles();
+        const std::string labels =
+            "{target=\"" + escape_label_str(h.display_name) +
+            "\",ip=\"" + escape_label_str(h.resolved_ip) +
+            "\",proto=\"" + escape_label_str(proto_label(h)) +
+            "\",category=\"" + category_label(h.category) +
+            "\",asn=\"" + escape_label_str(h.asn_info) + "\"} ";
+
+        const int up_val = (h.status == HostStatus::Online) ? 1 : 0;
+        char num_buf[64]{};
+
+        oss << "pingtop_host_up" << labels << up_val << "\n";
+        std::snprintf(num_buf, sizeof(num_buf), "%.3f", h.last_rtt_ms);
+        oss << "pingtop_rtt_ms" << labels << num_buf << "\n";
+        std::snprintf(num_buf, sizeof(num_buf), "%.3f", h.min_rtt_ms);
+        oss << "pingtop_rtt_min_ms" << labels << num_buf << "\n";
+        std::snprintf(num_buf, sizeof(num_buf), "%.3f", h.avg_rtt_ms);
+        oss << "pingtop_rtt_avg_ms" << labels << num_buf << "\n";
+        std::snprintf(num_buf, sizeof(num_buf), "%.3f", h.max_rtt_ms);
+        oss << "pingtop_rtt_max_ms" << labels << num_buf << "\n";
+        std::snprintf(num_buf, sizeof(num_buf), "%.3f", pct.p50);
+        oss << "pingtop_rtt_p50_ms" << labels << num_buf << "\n";
+        std::snprintf(num_buf, sizeof(num_buf), "%.3f", pct.p95);
+        oss << "pingtop_rtt_p95_ms" << labels << num_buf << "\n";
+        std::snprintf(num_buf, sizeof(num_buf), "%.3f", pct.p99);
+        oss << "pingtop_rtt_p99_ms" << labels << num_buf << "\n";
+        std::snprintf(num_buf, sizeof(num_buf), "%.3f", h.jitter_ms);
+        oss << "pingtop_jitter_ms" << labels << num_buf << "\n";
+        std::snprintf(num_buf, sizeof(num_buf), "%.2f", h.packet_loss_percent());
+        oss << "pingtop_loss_percent" << labels << num_buf << "\n";
+        oss << "pingtop_path_mtu_bytes" << labels << h.path_mtu << "\n";
+        oss << "pingtop_packets_sent_total" << labels << h.sent_count << "\n";
+        oss << "pingtop_packets_lost_total" << labels << h.lost_count << "\n";
+    }
+
+    oss << "# HELP pingtop_iface_rx_bytes_total Total bytes received on network interface\n"
+        << "# TYPE pingtop_iface_rx_bytes_total counter\n"
+        << "# HELP pingtop_iface_tx_bytes_total Total bytes transmitted on network interface\n"
+        << "# TYPE pingtop_iface_tx_bytes_total counter\n"
+        << "# HELP pingtop_iface_rx_bps Current download throughput in bytes per second\n"
+        << "# TYPE pingtop_iface_rx_bps gauge\n"
+        << "# HELP pingtop_iface_tx_bps Current upload throughput in bytes per second\n"
+        << "# TYPE pingtop_iface_tx_bps gauge\n"
+        << "# HELP pingtop_iface_rx_errors_total Total RX packet errors on interface\n"
+        << "# TYPE pingtop_iface_rx_errors_total counter\n"
+        << "# HELP pingtop_iface_tx_errors_total Total TX packet errors on interface\n"
+        << "# TYPE pingtop_iface_tx_errors_total counter\n"
+        << "# HELP pingtop_iface_rx_drops_total Total RX dropped packets on interface\n"
+        << "# TYPE pingtop_iface_rx_drops_total counter\n"
+        << "# HELP pingtop_iface_tx_drops_total Total TX dropped packets on interface\n"
+        << "# TYPE pingtop_iface_tx_drops_total counter\n"
+        << "# HELP pingtop_iface_mtu_bytes Hardware/interface MTU in bytes\n"
+        << "# TYPE pingtop_iface_mtu_bytes gauge\n";
+
+    for (const auto& iface : net_interfaces_) {
+        const std::string ilabels =
+            "{iface=\"" + escape_label_str(iface.name) +
+            "\",ipv4=\"" + escape_label_str(iface.ipv4) +
+            "\",bond=\"" + escape_label_str(iface.bond_info) + "\"} ";
+        char num_buf[64]{};
+
+        oss << "pingtop_iface_rx_bytes_total" << ilabels << iface.rx_total << "\n";
+        oss << "pingtop_iface_tx_bytes_total" << ilabels << iface.tx_total << "\n";
+        std::snprintf(num_buf, sizeof(num_buf), "%.1f", iface.rx_speed_bps);
+        oss << "pingtop_iface_rx_bps" << ilabels << num_buf << "\n";
+        std::snprintf(num_buf, sizeof(num_buf), "%.1f", iface.tx_speed_bps);
+        oss << "pingtop_iface_tx_bps" << ilabels << num_buf << "\n";
+        oss << "pingtop_iface_rx_errors_total" << ilabels << iface.rx_errors << "\n";
+        oss << "pingtop_iface_tx_errors_total" << ilabels << iface.tx_errors << "\n";
+        oss << "pingtop_iface_rx_drops_total" << ilabels << iface.rx_drops << "\n";
+        oss << "pingtop_iface_tx_drops_total" << ilabels << iface.tx_drops << "\n";
+        oss << "pingtop_iface_mtu_bytes" << ilabels << iface.mtu << "\n";
+    }
+
+    return oss.str();
+}
+
+std::string NetworkMonitor::format_json_metrics() const {
+    std::ostringstream oss;
+    const auto uptime_s = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start_time_
+    ).count();
+
+    oss << "{\n"
+        << "  \"version\": \"1.4.0\",\n"
+        << "  \"rounds\": " << completed_rounds_ << ",\n"
+        << "  \"uptime_sec\": " << uptime_s << ",\n"
+        << "  \"hosts\": [\n";
+
+    for (std::size_t i = 0; i < hosts_.size(); ++i) {
+        const auto& h = hosts_[i];
+        const auto pct = h.compute_percentiles();
+        const int up_val = (h.status == HostStatus::Online) ? 1 : 0;
+        char metrics_buf[256]{};
+        std::snprintf(
+            metrics_buf,
+            sizeof(metrics_buf),
+            "\"loss_pct\": %.2f, \"last_rtt_ms\": %.3f, \"min_rtt_ms\": %.3f, \"avg_rtt_ms\": %.3f, "
+            "\"max_rtt_ms\": %.3f, \"p50_ms\": %.3f, \"p95_ms\": %.3f, \"p99_ms\": %.3f, \"jitter_ms\": %.3f",
+            h.packet_loss_percent(),
+            h.last_rtt_ms,
+            h.min_rtt_ms,
+            h.avg_rtt_ms,
+            h.max_rtt_ms,
+            pct.p50,
+            pct.p95,
+            pct.p99,
+            h.jitter_ms
+        );
+
+        oss << "    {"
+            << "\"target\": \"" << escape_label_str(h.display_name) << "\", "
+            << "\"ip\": \"" << escape_label_str(h.resolved_ip) << "\", "
+            << "\"proto\": \"" << escape_label_str(proto_label(h)) << "\", "
+            << "\"category\": \"" << category_label(h.category) << "\", "
+            << "\"asn\": \"" << escape_label_str(h.asn_info) << "\", "
+            << "\"up\": " << up_val << ", "
+            << "\"mtu\": " << h.path_mtu << ", "
+            << "\"ttl\": " << static_cast<unsigned int>(h.last_ttl) << ", "
+            << "\"sent\": " << h.sent_count << ", "
+            << "\"recv\": " << h.received_count << ", "
+            << "\"lost\": " << h.lost_count << ", "
+            << metrics_buf
+            << "}" << ((i + 1 < hosts_.size()) ? "," : "") << "\n";
+    }
+
+    oss << "  ],\n  \"interfaces\": [\n";
+    for (std::size_t i = 0; i < net_interfaces_.size(); ++i) {
+        const auto& iface = net_interfaces_[i];
+        char rate_buf[128]{};
+        std::snprintf(
+            rate_buf,
+            sizeof(rate_buf),
+            "\"rx_bps\": %.1f, \"tx_bps\": %.1f",
+            iface.rx_speed_bps,
+            iface.tx_speed_bps
+        );
+        oss << "    {"
+            << "\"name\": \"" << escape_label_str(iface.name) << "\", "
+            << "\"ipv4\": \"" << escape_label_str(iface.ipv4) << "\", "
+            << "\"mtu\": " << iface.mtu << ", "
+            << "\"bond\": \"" << escape_label_str(iface.bond_info) << "\", "
+            << "\"rx_bytes\": " << iface.rx_total << ", "
+            << "\"tx_bytes\": " << iface.tx_total << ", "
+            << "\"rx_errors\": " << iface.rx_errors << ", "
+            << "\"tx_errors\": " << iface.tx_errors << ", "
+            << "\"rx_drops\": " << iface.rx_drops << ", "
+            << "\"tx_drops\": " << iface.tx_drops << ", "
+            << rate_buf
+            << "}" << ((i + 1 < net_interfaces_.size()) ? "," : "") << "\n";
+    }
+    oss << "  ]\n}\n";
+    return oss.str();
+}
+
+void NetworkMonitor::serve_exporter_request() const noexcept {
+    if (exporter_fd_ < 0) {
+        return;
+    }
+
+    while (true) {
+        sockaddr_in cli_addr{};
+        socklen_t cli_len = sizeof(cli_addr);
+        const int cli = ::accept(exporter_fd_, reinterpret_cast<sockaddr*>(&cli_addr), &cli_len);
+        if (cli < 0) {
+            break;
+        }
+
+#if defined(SO_NOSIGPIPE)
+        const int no_sigpipe = 1;
+        (void)::setsockopt(cli, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
+
+        char req_buf[512]{};
+        const ssize_t rlen = ::recv(cli, req_buf, sizeof(req_buf) - 1, 0);
+        const std::string_view req_sv(req_buf, (rlen > 0) ? static_cast<std::size_t>(rlen) : 0U);
+
+        const bool want_json = req_sv.starts_with("GET /json") || req_sv.starts_with("GET /api");
+        const std::string body = want_json ? format_json_metrics() : format_prometheus_metrics();
+        const char* ctype = want_json
+            ? "application/json; charset=utf-8"
+            : "text/plain; version=0.0.4; charset=utf-8";
+
+        std::string resp;
+        resp.reserve(256 + body.size());
+        resp.append("HTTP/1.1 200 OK\r\nContent-Type: ")
+            .append(ctype)
+            .append("\r\nContent-Length: ")
+            .append(std::to_string(body.size()))
+            .append("\r\nConnection: close\r\n\r\n")
+            .append(body);
+
+        int send_flags = 0;
+#if defined(MSG_NOSIGNAL)
+        send_flags |= MSG_NOSIGNAL;
+#endif
+        (void)::send(cli, resp.data(), resp.size(), send_flags);
+        ::close(cli);
     }
 }
 

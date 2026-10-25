@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(pingtop
-    VERSION 1.0.0
+    VERSION 1.4.0
     DESCRIPTION "Interactive cross-platform TUI monitor for network latency and quality"
     LANGUAGES CXX
 )
@@ -54,7 +54,7 @@ set(CPACK_GENERATOR "DEB")
 set(CPACK_PACKAGE_NAME "pingtop")
 set(CPACK_PACKAGE_VENDOR "vals0v")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Interactive C++20 network latency, MTR, traffic and quality monitor")
-set(CPACK_PACKAGE_VERSION "1.3.0")
+set(CPACK_PACKAGE_VERSION "1.4.0")
 set(CPACK_PACKAGE_CONTACT "vals0v <https://github.com/vals0v/Pingtop>")
 set(CPACK_DEBIAN_PACKAGE_SECTION "net")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")

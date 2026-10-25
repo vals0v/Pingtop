@@ -249,11 +249,7 @@ TuiRenderer::~TuiRenderer() noexcept {
     shutdown();
 }
 
-bool TuiRenderer::initialize() noexcept {
-    if (initialized_) {
-        return true;
-    }
-
+void TuiRenderer::install_signal_handlers() noexcept {
     struct sigaction sa{};
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
@@ -261,6 +257,14 @@ bool TuiRenderer::initialize() noexcept {
     (void)::sigaction(SIGINT, &sa, nullptr);
     (void)::sigaction(SIGTERM, &sa, nullptr);
     (void)::sigaction(SIGWINCH, &sa, nullptr);
+}
+
+bool TuiRenderer::initialize() noexcept {
+    if (initialized_) {
+        return true;
+    }
+
+    install_signal_handlers();
 
     if (::isatty(STDIN_FILENO) != 0) {
         if (::tcgetattr(STDIN_FILENO, &orig_termios_) == 0) {
@@ -621,13 +625,17 @@ void TuiRenderer::append_header(const NetworkMonitor& monitor) {
 
     frame_buffer_.append(kBgTitle).append(kBold).append(kFgWhite);
     if (term_width_ >= 96 && status_msg.empty()) {
-        frame_buffer_.append(" ⚡ PINGTOP v1.3 — Network Latency, MTR & Quality Monitor ");
+        frame_buffer_.append(" ⚡ PINGTOP v1.4 — Network Latency, MTR & Quality Monitor ");
     } else {
-        frame_buffer_.append(" ⚡ PINGTOP v1.3 ");
+        frame_buffer_.append(" ⚡ PINGTOP v1.4 ");
     }
     frame_buffer_.append(kFgCyan).append(" ").append(mode_badge).append(" ");
     if (term_width_ >= 80) {
         frame_buffer_.append(kFgWhite).append(" [ICMP: ").append(monitor.socket().mode_string()).append("] ");
+    }
+    if (monitor.is_exporter_active()) {
+        frame_buffer_.append(kFgGreen).append(kBold)
+                     .append(" [PROM :").append(std::to_string(monitor.exporter_port())).append("] ");
     }
     if (monitor.is_paused()) {
         frame_buffer_.append(kFgYellow).append(kBold).append(" [PAUSED] ");
@@ -1046,13 +1054,18 @@ void TuiRenderer::append_footer(const NetworkMonitor& monitor, const std::vector
 
     // Compact vertical fallback when terminal height < 24 rows
     if (term_height_ < 24) {
-        const std::string compact_hdr = " ▼ [ NET: " + net.name + " (" + net.ipv4 + ") ] ";
+        const std::string compact_hdr = " ▼ [ NET: " + net.name + " (" + net.ipv4 + ") " +
+                                        std::to_string(net.mtu) + "B ] ";
         frame_buffer_.append(kBgSection).append(kBold).append(kFgYellow).append(compact_hdr)
                      .append(kFgCyan).append(" ▼ DL: ").append(rx_rate_str).append(" (Tot: ").append(rx_total_str).append(") ")
                      .append(kFgOrange).append(" ▲ UL: ").append(tx_rate_str).append(" (Tot: ").append(tx_total_str).append(")")
                      .append(kClearLineEnd).append(kReset).append("\n");
     } else {
-        const std::string iface_banner = " ▼ [ NETWORK TRAFFIC & INTERFACE: " + net.name + " (" + net.ipv4 + ") ] ";
+        std::string iface_meta = net.name + " (" + net.ipv4 + ") MTU:" + std::to_string(net.mtu) + "B";
+        if (!net.bond_info.empty()) {
+            iface_meta += " " + net.bond_info;
+        }
+        const std::string iface_banner = " ▼ [ NETWORK TRAFFIC & INTERFACE: " + iface_meta + " ] ";
         const std::string iface_nav    = " [ < / > Switch Iface │ z Reset ] ";
         frame_buffer_.append(kBgSection).append(kBold).append(kFgYellow).append(iface_banner).append(kReset);
 
@@ -1136,7 +1149,13 @@ void TuiRenderer::append_footer(const NetworkMonitor& monitor, const std::vector
             append_block_graph_row(frame_buffer_, net.rx_history, graph_cols, 0, 2, rx_max, kFgCyan);
             if (show_side_box) {
                 frame_buffer_.append(kReset).append(kBorderColor).append("│ ").append(kReset);
-                frame_buffer_.append(kFgGray).append(format_side_cell("Peak Rate:", rx_top_str)).append(kReset);
+                const std::uint64_t rx_faults = net.rx_drops + net.rx_errors;
+                if (rx_faults > 0) {
+                    const std::string fault_str = std::to_string(net.rx_drops) + "d / " + std::to_string(net.rx_errors) + "e";
+                    frame_buffer_.append(kFgYellow).append(format_side_cell("RX Drop/Err:", fault_str)).append(kReset);
+                } else {
+                    frame_buffer_.append(kFgGray).append(format_side_cell("Peak Rate:", rx_top_str)).append(kReset);
+                }
             }
             frame_buffer_.append(kReset).append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
         }
@@ -1187,7 +1206,11 @@ void TuiRenderer::append_footer(const NetworkMonitor& monitor, const std::vector
             append_block_graph_row(frame_buffer_, net.tx_history, graph_cols, 0, 2, tx_max, kFgOrange);
             if (show_side_box) {
                 frame_buffer_.append(kReset).append(kBorderColor).append("│ ").append(kReset);
-                frame_buffer_.append(kFgGray).append(format_side_cell("Peak Rate:", tx_top_str)).append(kReset);
+                const std::uint64_t all_faults = net.rx_drops + net.tx_drops + net.rx_errors + net.tx_errors;
+                const std::string fault_str = std::to_string(net.rx_drops + net.tx_drops) + "d / " +
+                                              std::to_string(net.rx_errors + net.tx_errors) + "e";
+                frame_buffer_.append((all_faults > 0) ? kFgRed : kFgGray)
+                             .append(format_side_cell("Drops / Errs:", fault_str)).append(kReset);
             }
             frame_buffer_.append(kReset).append(kBorderColor).append("│").append(kReset).append(kClearLineEnd).append("\n");
         }

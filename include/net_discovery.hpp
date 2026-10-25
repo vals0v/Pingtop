@@ -29,8 +29,15 @@ struct NetInterfaceStats {
 
     std::string   name;
     std::string   ipv4;
+    std::uint16_t mtu{1500};
     std::uint64_t rx_total{0};
     std::uint64_t tx_total{0};
+    std::uint64_t rx_errors{0};
+    std::uint64_t tx_errors{0};
+    std::uint64_t rx_drops{0};
+    std::uint64_t tx_drops{0};
+    std::string   bond_info;
+    std::string   lldp_peer;
     double        rx_speed_bps{0.0};
     double        tx_speed_bps{0.0};
     double        rx_top_bps{0.0};
@@ -53,6 +60,7 @@ public:
     [[nodiscard]] static std::vector<std::string> get_local_ips();
     [[nodiscard]] static std::vector<DiscoveredTarget> discover_lan_devices();
     [[nodiscard]] static std::vector<DiscoveredTarget> discover_vpn_and_tailscale();
+    [[nodiscard]] static std::vector<DiscoveredTarget> discover_datacenter_infra();
     [[nodiscard]] static std::vector<DiscoveredTarget> discover_all();
 
     static void sample_net_interfaces(

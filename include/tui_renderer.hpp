@@ -30,6 +30,7 @@ public:
 
     [[nodiscard]] bool initialize() noexcept;
     void shutdown() noexcept;
+    static void install_signal_handlers() noexcept;
 
     [[nodiscard]] static bool should_quit() noexcept;
     static void request_quit() noexcept;

@@ -109,6 +109,7 @@ struct MonitorConfig {
     std::chrono::milliseconds ping_timeout{900};
     std::uint64_t             max_cycles{0};
     std::string               config_file_path;
+    std::uint16_t             exporter_port{0};
 };
 
 class NetworkMonitor {
@@ -174,6 +175,12 @@ public:
     [[nodiscard]] std::uint64_t completed_rounds() const noexcept { return completed_rounds_; }
     [[nodiscard]] std::chrono::steady_clock::time_point start_time() const noexcept { return start_time_; }
 
+    // Prometheus HTTP Exporter & JSON Telemetry
+    [[nodiscard]] bool is_exporter_active() const noexcept { return exporter_fd_ >= 0; }
+    [[nodiscard]] std::uint16_t exporter_port() const noexcept { return config_.exporter_port; }
+    [[nodiscard]] std::string format_prometheus_metrics() const;
+    [[nodiscard]] std::string format_json_metrics() const;
+
     static constexpr int kKeyArrowUp    = -101;
     static constexpr int kKeyArrowDown  = -102;
     static constexpr int kKeyBackspace  = -103;
@@ -188,12 +195,14 @@ private:
     void check_timeouts(std::chrono::steady_clock::time_point now);
     void drain_replies(std::chrono::steady_clock::time_point now);
     void read_mtr_pipe();
+    void serve_exporter_request() const noexcept;
     static void record_reply(HostEntry& host, double rtt_ms, std::uint8_t ttl) noexcept;
     static void record_timeout(HostEntry& host) noexcept;
     static void close_tcp_probe(HostEntry& host) noexcept;
 
     MonitorConfig                         config_;
     IcmpSocket                            socket_;
+    int                                   exporter_fd_{-1};
     std::vector<HostEntry>                hosts_;
     std::chrono::steady_clock::time_point start_time_;
     std::chrono::steady_clock::time_point last_batch_send_time_{};

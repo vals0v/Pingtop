@@ -417,11 +417,42 @@ std::uint16_t IcmpSocket::probe_path_mtu(const sockaddr_in& dest_addr) noexcept 
     (void)set_nonblocking(sock);
 
     std::uint16_t low = 576;
-    std::uint16_t high = 1500;
+    std::uint16_t high = 9000;
     std::uint16_t best_send_mtu = 1280;
 
-    std::vector<std::uint8_t> pkt(1500, 0x42);
+    std::vector<std::uint8_t> pkt(9000, 0x42);
+    std::vector<std::uint8_t> rbuf(9020, 0);
     const std::uint16_t ident = to_network_u16(static_cast<std::uint16_t>((::getpid() ^ 0x5A5A) & 0xFFFF));
+
+    // Fast-path check: if local interface/route rejects 1501B, cap search range at 1500B
+    // Otherwise search full Jumbo Frame range up to 9000B (SAN / Ceph / Datacenter fabrics)
+    {
+        constexpr std::size_t kJumboProbeLen = 1501U - 20U;
+        IcmpHeader hdr{};
+        hdr.type = kIcmpEchoRequest;
+        hdr.code = 0;
+        hdr.checksum = 0;
+        hdr.identifier = ident;
+        hdr.sequence = to_network_u16(1501U);
+        std::memcpy(pkt.data(), &hdr, sizeof(hdr));
+        hdr.checksum = compute_checksum(pkt.data(), kJumboProbeLen);
+        std::memcpy(pkt.data(), &hdr, sizeof(hdr));
+
+        const ssize_t sent = ::sendto(
+            sock,
+            pkt.data(),
+            kJumboProbeLen,
+            0,
+            reinterpret_cast<const sockaddr*>(&dest_addr),
+            sizeof(dest_addr)
+        );
+        if (sent < 0 && errno == EMSGSIZE) {
+            high = 1500;
+        } else if (sent == static_cast<ssize_t>(kJumboProbeLen)) {
+            best_send_mtu = 1501;
+            low = 1501;
+        }
+    }
 
     // Binary search maximum unfragmented frame size accepted by kernel route & remote peer
     while (low <= high) {
@@ -455,9 +486,8 @@ std::uint16_t IcmpSocket::probe_path_mtu(const sockaddr_in& dest_addr) noexcept 
         if (sent == static_cast<ssize_t>(icmp_len)) {
             best_send_mtu = mid;
             pollfd pfd{sock, POLLIN, 0};
-            if (::poll(&pfd, 1, 35) > 0) {
-                std::uint8_t rbuf[1600];
-                (void)::recvfrom(sock, rbuf, sizeof(rbuf), 0, nullptr, nullptr);
+            if (::poll(&pfd, 1, 25) > 0) {
+                (void)::recvfrom(sock, rbuf.data(), rbuf.size(), 0, nullptr, nullptr);
             }
             low = static_cast<std::uint16_t>(mid + 1);
         } else {

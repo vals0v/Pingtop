@@ -14,18 +14,22 @@ namespace {
 
 void print_help(std::string_view prog_name) {
     std::cout
-        << "Pingtop v1.3.0 — Interactive TUI Network Latency, MTR & Quality Monitor (C++20)\n\n"
+        << "Pingtop v1.4.0 — Interactive TUI & Datacenter Network Telemetry Probe (C++20)\n\n"
         << "Usage:\n"
         << "  " << prog_name << " [OPTIONS] [HOST... | HOST:PORT... | dns://HOST... | LABEL=TARGET...]\n\n"
         << "Options:\n"
         << "  -i, --interval <ms>   Ping interval in milliseconds (100..10000, default: 1000)\n"
         << "  -c, --count <num>     Exit automatically after <num> ping rounds (default: 0 = infinite)\n"
         << "  -f, --config <path>   Path to config file (default: ~/.config/pingtop/hosts.conf)\n"
+        << "  -e, --exporter <port> Enable Prometheus /metrics & /json HTTP exporter (e.g. 9100 or :9100)\n"
+        << "      --headless        Run in daemon/server mode without interactive TUI\n"
+        << "      --json            Output telemetry summary in JSON format\n"
         << "  -h, --help            Show this help message and exit\n\n"
         << "Examples:\n"
-        << "  " << prog_name << "                                      # Auto-discover LAN, VPN, Tailscale & config\n"
+        << "  " << prog_name << "                                      # Auto-discover LAN, DC, VPN, Tailscale & config\n"
+        << "  " << prog_name << " --exporter 9100 --headless           # Run as Prometheus Datacenter Probe on :9100\n"
         << "  " << prog_name << " 1.1.1.1 github.com:443 dns://8.8.8.8 # ICMP + TCP SYN + UDP:53 DNS Benchmark\n"
-        << "  " << prog_name << " 2606:4700:4700::1111                 # IPv6 ICMPv6 Ping\n\n"
+        << "  " << prog_name << " -c 5 --json                          # Run 5 probe cycles and output JSON report\n\n"
         << "Interactive TUI Hotkeys:\n"
         << "  Enter / v   Open 2D Latency Graph, Percentiles (p50/p90/p95/p99), ASN & Histogram\n"
         << "  t           Open live Hop-by-Hop MTR / Traceroute view with GeoIP/ASN per hop\n"
@@ -82,12 +86,40 @@ void print_final_summary(const pingtop::NetworkMonitor& monitor) {
 int main(int argc, char* argv[]) {
     pingtop::MonitorConfig config{};
     std::vector<std::pair<std::string, std::string>> custom_targets;
+    bool headless_mode = false;
+    bool json_output = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         if (arg == "-h" || arg == "--help") {
             print_help(argv[0]);
             return EXIT_SUCCESS;
+        }
+        if (arg == "--headless") {
+            headless_mode = true;
+            continue;
+        }
+        if (arg == "--json") {
+            json_output = true;
+            headless_mode = true;
+            continue;
+        }
+        if (arg == "-e" || arg == "--exporter") {
+            std::string_view port_sv = "9100";
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                port_sv = argv[++i];
+            }
+            if (const auto colon = port_sv.rfind(':'); colon != std::string_view::npos) {
+                port_sv.remove_prefix(colon + 1);
+            }
+            const std::string port_str(port_sv);
+            const long p = std::strtol(port_str.c_str(), nullptr, 10);
+            if (p <= 0 || p > 65535) {
+                std::cerr << "Error: Invalid exporter port '" << port_str << "' (must be 1..65535).\n";
+                return EXIT_FAILURE;
+            }
+            config.exporter_port = static_cast<std::uint16_t>(p);
+            continue;
         }
         if (arg == "-i" || arg == "--interval") {
             if (i + 1 >= argc) {
@@ -153,13 +185,33 @@ int main(int argc, char* argv[]) {
     }
 
     pingtop::TuiRenderer renderer;
-    (void)renderer.initialize();
+    if (!headless_mode) {
+        (void)renderer.initialize();
+    } else {
+        pingtop::TuiRenderer::install_signal_handlers();
+        if (monitor.is_exporter_active() && !json_output) {
+            std::cout << "Pingtop v1.4.0 Headless Probe started — Prometheus exporter listening on http://0.0.0.0:"
+                      << monitor.exporter_port() << "/metrics (JSON: /json)\n";
+        }
+    }
 
     auto last_render_time = std::chrono::steady_clock::time_point{};
     constexpr std::chrono::milliseconds kRenderInterval(50);
 
     while (!pingtop::TuiRenderer::should_quit()) {
         bool force_redraw = false;
+
+        if (headless_mode) {
+            monitor.poll_once(50, nullptr);
+            if (config.max_cycles > 0 && monitor.completed_rounds() >= config.max_cycles) {
+                const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+                while (std::chrono::steady_clock::now() < wait_deadline && !pingtop::TuiRenderer::should_quit()) {
+                    monitor.poll_once(20, nullptr);
+                }
+                break;
+            }
+            continue;
+        }
 
         monitor.poll_once(25, [&](int key) {
             force_redraw = true;
@@ -318,8 +370,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    renderer.shutdown();
-    print_final_summary(monitor);
+    if (!headless_mode) {
+        renderer.shutdown();
+    }
+    if (json_output) {
+        std::cout << monitor.format_json_metrics();
+    } else {
+        print_final_summary(monitor);
+    }
 
     return EXIT_SUCCESS;
 }

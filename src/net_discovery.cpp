@@ -328,17 +328,26 @@ std::uint16_t NetDiscovery::detect_route_mtu(const std::string& ip, bool is_ipv6
     sin.sin_family = AF_INET;
     if (::inet_pton(AF_INET, ip.c_str(), &sin.sin_addr) == 1) {
         int sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        if (sock < 0) {
+            sock = ::socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+        }
         if (sock >= 0) {
 #if defined(__APPLE__)
             const int df = 1;
             (void)::setsockopt(sock, IPPROTO_IP, IP_DONTFRAG, &df, sizeof(df));
+#elif defined(__linux__) && defined(IP_MTU_DISCOVER) && defined(IP_PMTUDISC_DO)
+            const int pmtu = IP_PMTUDISC_DO;
+            (void)::setsockopt(sock, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu, sizeof(pmtu));
 #endif
             const int flags = ::fcntl(sock, F_GETFL, 0);
             if (flags >= 0) {
                 (void)::fcntl(sock, F_SETFL, flags | O_NONBLOCK);
             }
-            static constexpr std::array<std::uint16_t, 5> kCandidates = {1500, 1492, 1420, 1380, 1280};
-            std::vector<std::uint8_t> dummy(1500, 0);
+            // Test Jumbo Frames (9000B SAN/Ceph, 4470B, 4096B, 2000B) down to standard 1500B & tunnels
+            static constexpr std::array<std::uint16_t, 9> kCandidates = {
+                9000, 4470, 4096, 2000, 1500, 1492, 1420, 1380, 1280
+            };
+            std::vector<std::uint8_t> dummy(9000, 0);
             for (std::uint16_t cand : kCandidates) {
                 const std::size_t payload_sz = static_cast<std::size_t>(cand - 20);
                 const ssize_t rc = ::sendto(
@@ -872,11 +881,283 @@ std::vector<DiscoveredTarget> NetDiscovery::discover_vpn_and_tailscale() {
     return unique_targets;
 }
 
+std::vector<DiscoveredTarget> NetDiscovery::discover_datacenter_infra() {
+    std::vector<DiscoveredTarget> targets;
+    const auto local_ips = get_local_ips();
+    const auto gw = detect_default_gateway();
+    const auto host_map = build_fast_host_map();
+
+    auto is_local_or_gw = [&](const std::string& ip) {
+        if (ip.starts_with("127.") || ip.starts_with("0.") || ip.starts_with("224.") ||
+            ip.starts_with("239.") || ip.ends_with(".255")) {
+            return true;
+        }
+        if (gw.has_value() && *gw == ip) {
+            return true;
+        }
+        return std::find(local_ips.begin(), local_ips.end(), ip) != local_ips.end();
+    };
+
+    // 1. Linux Bridges, LACP Bonds, Proxmox/KVM vmbr, Docker & CNI Container Networks
+    ifaddrs* ifaddr = nullptr;
+    if (::getifaddrs(&ifaddr) == 0 && ifaddr != nullptr) {
+        for (const auto* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET || ifa->ifa_name == nullptr) {
+                continue;
+            }
+            if ((ifa->ifa_flags & IFF_UP) == 0 || (ifa->ifa_flags & IFF_LOOPBACK) != 0) {
+                continue;
+            }
+            const std::string ifname(ifa->ifa_name);
+            const bool is_dc_bridge =
+                ifname.starts_with("bond") || ifname.starts_with("team") ||
+                ifname.starts_with("br")   || ifname.starts_with("vmbr") ||
+                ifname.starts_with("docker") || ifname.starts_with("cni") ||
+                ifname.starts_with("flannel") || ifname.starts_with("calico") ||
+                ifname.starts_with("vxlan") || ifname.starts_with("virbr") ||
+                ifname.starts_with("ovs");
+
+            if (is_dc_bridge) {
+                char ip_buf[INET_ADDRSTRLEN]{};
+                const auto* sin = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
+                if (::inet_ntop(AF_INET, &sin->sin_addr, ip_buf, sizeof(ip_buf)) != nullptr) {
+                    const std::string ip_str(ip_buf);
+                    std::string kind = "Bridge";
+                    if (ifname.starts_with("bond") || ifname.starts_with("team")) {
+                        kind = "LACP Bond";
+                    } else if (ifname.starts_with("docker") || ifname.starts_with("cni") ||
+                               ifname.starts_with("flannel") || ifname.starts_with("calico")) {
+                        kind = "Container Net";
+                    } else if (ifname.starts_with("vmbr") || ifname.starts_with("virbr")) {
+                        kind = "Hypervisor Br";
+                    } else if (ifname.starts_with("vxlan")) {
+                        kind = "VXLAN Fabric";
+                    }
+                    targets.push_back({ip_str, kind + " (" + ifname + ")", HostCategory::LocalLan});
+                }
+            }
+        }
+        ::freeifaddrs(ifaddr);
+    }
+
+    // 2. Out-of-Band Management: IPMI / BMC / iDRAC / iLO discovery via ipmitool & hostname heuristics
+    {
+        for (const auto& [ip, name] : host_map) {
+            std::string lower_name = name;
+            std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (lower_name.find("ipmi") != std::string::npos ||
+                lower_name.find("idrac") != std::string::npos ||
+                lower_name.find("ilo") != std::string::npos ||
+                lower_name.find("bmc") != std::string::npos) {
+                targets.push_back({ip, "BMC/IPMI: " + name, HostCategory::LocalLan});
+                targets.push_back({ip + ":443", "BMC HTTPS: " + name, HostCategory::LocalLan});
+            }
+        }
+
+        const std::array<const char*, 3> ipmi_bins = {
+            "/usr/bin/ipmitool",
+            "/usr/sbin/ipmitool",
+            "/usr/local/bin/ipmitool"
+        };
+        for (const auto* bin : ipmi_bins) {
+            if (::access(bin, X_OK) != 0) {
+                continue;
+            }
+            std::string cmd = std::string(bin) + " lan print 2>/dev/null";
+            FILE* pipe = ::popen(cmd.c_str(), "r");
+            if (pipe != nullptr) {
+                char line[512]{};
+                std::string bmc_ip;
+                std::string bmc_gw;
+                while (std::fgets(line, sizeof(line), pipe) != nullptr) {
+                    const std::string_view sv(line);
+                    const auto colon = sv.find(':');
+                    if (colon == std::string_view::npos) {
+                        continue;
+                    }
+                    const std::string key = trim_copy(sv.substr(0, colon));
+                    const std::string val = trim_copy(sv.substr(colon + 1));
+                    in_addr test_addr{};
+                    if (key == "IP Address" && ::inet_pton(AF_INET, val.c_str(), &test_addr) == 1 && val != "0.0.0.0") {
+                        bmc_ip = val;
+                    } else if (key == "Default Gateway IP" && ::inet_pton(AF_INET, val.c_str(), &test_addr) == 1 && val != "0.0.0.0") {
+                        bmc_gw = val;
+                    }
+                }
+                ::pclose(pipe);
+                if (!bmc_ip.empty()) {
+                    targets.push_back({bmc_ip, "Local BMC / IPMI", HostCategory::LocalLan});
+                    targets.push_back({bmc_ip + ":443", "Local BMC WebUI", HostCategory::LocalLan});
+                }
+                if (!bmc_gw.empty() && !is_local_or_gw(bmc_gw)) {
+                    targets.push_back({bmc_gw, "OOB IPMI Gateway", HostCategory::LocalLan});
+                }
+                break;
+            }
+        }
+    }
+
+    // 3. LLDP Top-of-Rack (ToR) Switch discovery via lldpctl
+    {
+        const std::array<const char*, 3> lldp_bins = {
+            "/usr/sbin/lldpctl",
+            "/usr/bin/lldpctl",
+            "/usr/local/sbin/lldpctl"
+        };
+        for (const auto* bin : lldp_bins) {
+            if (::access(bin, X_OK) != 0) {
+                continue;
+            }
+            std::string cmd = std::string(bin) + " -f keyvalue 2>/dev/null";
+            FILE* pipe = ::popen(cmd.c_str(), "r");
+            if (pipe != nullptr) {
+                char line[512]{};
+                std::string last_sysname;
+                while (std::fgets(line, sizeof(line), pipe) != nullptr) {
+                    const std::string_view sv(line);
+                    const auto eq = sv.find('=');
+                    if (eq == std::string_view::npos) {
+                        continue;
+                    }
+                    const std::string_view key = sv.substr(0, eq);
+                    const std::string val = trim_copy(sv.substr(eq + 1));
+                    if (key.ends_with(".chassis.name")) {
+                        last_sysname = val;
+                    } else if (key.ends_with(".chassis.mgmt-ip")) {
+                        in_addr test_addr{};
+                        if (::inet_pton(AF_INET, val.c_str(), &test_addr) == 1 && !is_local_or_gw(val)) {
+                            const std::string label = last_sysname.empty()
+                                ? ("ToR Switch (" + val + ")")
+                                : ("ToR Switch: " + last_sysname);
+                            targets.push_back({val, label, HostCategory::LocalLan});
+                        }
+                    }
+                }
+                ::pclose(pipe);
+                break;
+            }
+        }
+    }
+
+    // 4. Local / Cluster DNS Resolvers (/etc/resolv.conf) & NTP Servers (/etc/chrony*, /etc/ntp.conf)
+    {
+        std::ifstream resolv("/etc/resolv.conf");
+        if (resolv.is_open()) {
+            std::string line;
+            while (std::getline(resolv, line)) {
+                const auto hash = line.find('#');
+                if (hash != std::string::npos) {
+                    line.erase(hash);
+                }
+                std::istringstream iss(line);
+                std::string kw, ip;
+                if ((iss >> kw >> ip) && kw == "nameserver") {
+                    in_addr test_addr{};
+                    if (::inet_pton(AF_INET, ip.c_str(), &test_addr) == 1 &&
+                        !ip.starts_with("127.") && ip != "1.1.1.1" && ip != "8.8.8.8" && ip != "9.9.9.9" &&
+                        (!gw.has_value() || *gw != ip) && !is_tailscale_ip(ip)) {
+                        const HostCategory cat = classify_ip_category(ip, HostCategory::LocalLan);
+                        targets.push_back({"dns://" + ip, "System DNS (" + ip + ")", cat});
+                    }
+                }
+            }
+        }
+
+        const std::array<const char*, 3> ntp_confs = {
+            "/etc/chrony/chrony.conf",
+            "/etc/chrony.conf",
+            "/etc/ntp.conf"
+        };
+        for (const auto* conf_path : ntp_confs) {
+            std::ifstream ntp_in(conf_path);
+            if (!ntp_in.is_open()) {
+                continue;
+            }
+            std::string line;
+            while (std::getline(ntp_in, line)) {
+                const auto hash = line.find('#');
+                if (hash != std::string::npos) {
+                    line.erase(hash);
+                }
+                std::istringstream iss(line);
+                std::string kw, target;
+                if ((iss >> kw >> target) && (kw == "server" || kw == "peer")) {
+                    in_addr test_addr{};
+                    if (::inet_pton(AF_INET, target.c_str(), &test_addr) == 1 && !target.starts_with("127.")) {
+                        const HostCategory cat = classify_ip_category(target, HostCategory::LocalLan);
+                        targets.push_back({target, "NTP Clock (" + target + ")", cat});
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // 5. Active Datacenter Infrastructure Sessions: BGP (:179), Ceph (:6789/:3300), K8s (:6443), etcd (:2379), iSCSI (:3260)
+#if defined(__linux__)
+    {
+        std::ifstream tcp_file("/proc/net/tcp");
+        if (tcp_file.is_open()) {
+            std::string line;
+            if (std::getline(tcp_file, line)) {
+                while (std::getline(tcp_file, line)) {
+                    std::istringstream iss(line);
+                    std::string sl, local_hex, rem_hex, state_hex;
+                    if (iss >> sl >> local_hex >> rem_hex >> state_hex) {
+                        if (state_hex != "01") {
+                            continue;
+                        }
+                        const auto lcolon = local_hex.find(':');
+                        const auto rcolon = rem_hex.find(':');
+                        if (lcolon == std::string::npos || rcolon == std::string::npos) {
+                            continue;
+                        }
+                        const unsigned long lport = std::strtoul(local_hex.substr(lcolon + 1).c_str(), nullptr, 16);
+                        const unsigned long ip_num = std::strtoul(rem_hex.substr(0, rcolon).c_str(), nullptr, 16);
+                        const unsigned long rport = std::strtoul(rem_hex.substr(rcolon + 1).c_str(), nullptr, 16);
+
+                        in_addr addr{};
+                        addr.s_addr = static_cast<in_addr_t>(ip_num);
+                        char ip_buf[INET_ADDRSTRLEN]{};
+                        if (::inet_ntop(AF_INET, &addr, ip_buf, sizeof(ip_buf)) == nullptr) {
+                            continue;
+                        }
+                        const std::string rem_ip(ip_buf);
+                        if (rem_ip.starts_with("127.")) {
+                            continue;
+                        }
+                        const HostCategory cat = classify_ip_category(rem_ip, HostCategory::LocalLan);
+                        if (rport == 179 || lport == 179) {
+                            targets.push_back({rem_ip + ":179", "BGP Peer (" + rem_ip + ")", cat});
+                        } else if (rport == 6789 || rport == 3300) {
+                            targets.push_back({rem_ip + ":" + std::to_string(rport), "Ceph MON (" + rem_ip + ")", cat});
+                        } else if (rport == 6443) {
+                            targets.push_back({rem_ip + ":6443", "K8s API (" + rem_ip + ")", cat});
+                        } else if (rport == 2379) {
+                            targets.push_back({rem_ip + ":2379", "etcd Peer (" + rem_ip + ")", cat});
+                        } else if (rport == 3260) {
+                            targets.push_back({rem_ip + ":3260", "iSCSI SAN (" + rem_ip + ")", cat});
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    return targets;
+}
+
 std::vector<DiscoveredTarget> NetDiscovery::discover_all() {
     std::vector<DiscoveredTarget> all;
     if (const auto gw = detect_default_gateway(); gw.has_value()) {
         all.push_back({*gw, "Router / Gateway", HostCategory::LocalLan});
         all.push_back({"dns://" + *gw, "Router DNS", HostCategory::LocalLan});
+    }
+    for (auto& dc : discover_datacenter_infra()) {
+        all.push_back(std::move(dc));
     }
     for (auto& dev : discover_lan_devices()) {
         all.push_back(std::move(dev));
@@ -900,8 +1181,14 @@ void NetDiscovery::sample_net_interfaces(
 
     struct RawCounter {
         std::string   ipv4;
+        std::uint16_t mtu{1500};
         std::uint64_t rx{0};
         std::uint64_t tx{0};
+        std::uint64_t rx_err{0};
+        std::uint64_t tx_err{0};
+        std::uint64_t rx_drop{0};
+        std::uint64_t tx_drop{0};
+        std::string   bond_info;
     };
     std::vector<std::pair<std::string, RawCounter>> counters;
 
@@ -938,6 +1225,12 @@ void NetDiscovery::sample_net_interfaces(
                 auto& c = find_or_add(name);
                 c.rx = static_cast<std::uint64_t>(ifd->ifi_ibytes);
                 c.tx = static_cast<std::uint64_t>(ifd->ifi_obytes);
+                c.rx_err = static_cast<std::uint64_t>(ifd->ifi_ierrors);
+                c.tx_err = static_cast<std::uint64_t>(ifd->ifi_oerrors);
+                c.rx_drop = static_cast<std::uint64_t>(ifd->ifi_iqdrops);
+                if (ifd->ifi_mtu > 0 && ifd->ifi_mtu <= 65535) {
+                    c.mtu = static_cast<std::uint16_t>(ifd->ifi_mtu);
+                }
             }
 #endif
         }
@@ -960,13 +1253,47 @@ void NetDiscovery::sample_net_interfaces(
                 continue;
             }
             std::istringstream iss(line.substr(colon + 1));
-            std::uint64_t rx_bytes = 0, dummy = 0, tx_bytes = 0;
-            if (iss >> rx_bytes >> dummy >> dummy >> dummy >> dummy >> dummy >> dummy >> dummy >> tx_bytes) {
-                for (auto& kv : counters) {
-                    if (kv.first == name) {
-                        kv.second.rx = rx_bytes;
-                        kv.second.tx = tx_bytes;
-                        break;
+            std::uint64_t rx_bytes = 0, rx_pkts = 0, rx_errs = 0, rx_drop = 0;
+            std::uint64_t rx_fifo = 0, rx_frame = 0, rx_comp = 0, rx_mcast = 0;
+            std::uint64_t tx_bytes = 0, tx_pkts = 0, tx_errs = 0, tx_drop = 0;
+            if (iss >> rx_bytes >> rx_pkts >> rx_errs >> rx_drop >> rx_fifo >> rx_frame >> rx_comp >> rx_mcast
+                    >> tx_bytes >> tx_pkts >> tx_errs >> tx_drop) {
+                auto& c = find_or_add(name);
+                c.rx = rx_bytes;
+                c.tx = tx_bytes;
+                c.rx_err = rx_errs;
+                c.tx_err = tx_errs;
+                c.rx_drop = rx_drop;
+                c.tx_drop = tx_drop;
+
+                std::ifstream mtu_in("/sys/class/net/" + name + "/mtu");
+                unsigned int mtu_val = 1500;
+                if (mtu_in.is_open() && (mtu_in >> mtu_val) && mtu_val > 0 && mtu_val <= 65535) {
+                    c.mtu = static_cast<std::uint16_t>(mtu_val);
+                }
+
+                if (name.starts_with("bond")) {
+                    std::ifstream bond_in("/proc/net/bonding/" + name);
+                    if (bond_in.is_open()) {
+                        std::string bline;
+                        int up_slaves = 0;
+                        int total_slaves = 0;
+                        bool in_slave = false;
+                        while (std::getline(bond_in, bline)) {
+                            if (bline.starts_with("Slave Interface:")) {
+                                in_slave = true;
+                                ++total_slaves;
+                            } else if (in_slave && bline.starts_with("MII Status:")) {
+                                if (bline.find("up") != std::string::npos) {
+                                    ++up_slaves;
+                                }
+                            }
+                        }
+                        if (total_slaves > 0) {
+                            c.bond_info = "LACP " + std::to_string(up_slaves) + "/" +
+                                          std::to_string(total_slaves) +
+                                          ((up_slaves == total_slaves) ? " UP" : " DEGRADED");
+                        }
                     }
                 }
             }
@@ -975,11 +1302,27 @@ void NetDiscovery::sample_net_interfaces(
 #endif
 
     for (const auto& [name, raw] : counters) {
-        if (raw.ipv4.empty() && raw.rx == 0 && raw.tx == 0) {
+        const bool is_dc_iface =
+            name.starts_with("bond") || name.starts_with("team") ||
+            name.starts_with("br")   || name.starts_with("vmbr") ||
+            name.starts_with("docker") || name.starts_with("cni") ||
+            name.starts_with("vxlan");
+
+        // 1. Hide phantom / internal macOS & Linux tunnel interfaces without an assigned IPv4 address
+        // (macOS automatically creates utun0..utun12 for internal daemons like AirDrop, FindMy, etc.)
+        if (raw.ipv4.empty() && (name.starts_with("utun") || name.starts_with("tun") || name.starts_with("tap"))) {
             continue;
         }
+
+        // 2. Hide loopback and internal Apple wireless/virtual interfaces
         if (name.starts_with("lo") || name.starts_with("awdl") || name.starts_with("llw") ||
-            name.starts_with("anpi") || name.starts_with("ap")) {
+            name.starts_with("anpi") || name.starts_with("ap") || name.starts_with("nan") ||
+            name.starts_with("gif") || name.starts_with("stf")) {
+            continue;
+        }
+
+        // 3. Skip idle interfaces without IPv4 and without traffic (unless Datacenter bridge/bond)
+        if (raw.ipv4.empty() && raw.rx == 0 && raw.tx == 0 && !is_dc_iface) {
             continue;
         }
 
@@ -991,8 +1334,14 @@ void NetDiscovery::sample_net_interfaces(
             NetInterfaceStats st{};
             st.name = name;
             st.ipv4 = raw.ipv4.empty() ? "---" : raw.ipv4;
+            st.mtu = raw.mtu;
             st.rx_total = raw.rx;
             st.tx_total = raw.tx;
+            st.rx_errors = raw.rx_err;
+            st.tx_errors = raw.tx_err;
+            st.rx_drops = raw.rx_drop;
+            st.tx_drops = raw.tx_drop;
+            st.bond_info = raw.bond_info;
             st.rx_top_bps = 4096.0;
             st.tx_top_bps = 4096.0;
             net_interfaces.push_back(std::move(st));
@@ -1000,6 +1349,13 @@ void NetDiscovery::sample_net_interfaces(
             if (!raw.ipv4.empty()) {
                 it->ipv4 = raw.ipv4;
             }
+            it->mtu = raw.mtu;
+            it->rx_errors = raw.rx_err;
+            it->tx_errors = raw.tx_err;
+            it->rx_drops = raw.rx_drop;
+            it->tx_drops = raw.tx_drop;
+            it->bond_info = raw.bond_info;
+
             if (dt_sec >= 0.05 && raw.rx >= it->rx_total && raw.tx >= it->tx_total) {
                 const double inst_rx = static_cast<double>(raw.rx - it->rx_total) / dt_sec;
                 const double inst_tx = static_cast<double>(raw.tx - it->tx_total) / dt_sec;
@@ -1014,6 +1370,27 @@ void NetDiscovery::sample_net_interfaces(
             it->tx_total = raw.tx;
         }
     }
+
+    // Prioritize physical network adapters with assigned IPv4 (en0, eth0) as the primary displayed interface
+    std::stable_sort(net_interfaces.begin(), net_interfaces.end(), [](const NetInterfaceStats& a, const NetInterfaceStats& b) {
+        auto rank = [](const NetInterfaceStats& s) -> int {
+            const bool has_ip = !s.ipv4.empty() && s.ipv4 != "---";
+            if (s.name.starts_with("en") || s.name.starts_with("eth") || s.name.starts_with("wlan")) {
+                return has_ip ? 0 : 3;
+            }
+            if (s.name.starts_with("bond") || s.name.starts_with("team")) {
+                return has_ip ? 1 : 4;
+            }
+            if (s.name.starts_with("br") || s.name.starts_with("vmbr") || s.name.starts_with("docker") || s.name.starts_with("cni")) {
+                return has_ip ? 2 : 5;
+            }
+            if (s.name.starts_with("utun") || s.name.starts_with("tun") || s.name.starts_with("wg") || s.name.starts_with("tailscale")) {
+                return has_ip ? 2 : 6;
+            }
+            return has_ip ? 3 : 7;
+        };
+        return rank(a) < rank(b);
+    });
 }
 
 } // namespace pingtop
